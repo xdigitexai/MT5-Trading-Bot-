@@ -1,4 +1,15 @@
+﻿"""News filter. Unconfigured feed does not block trading."""
 class NewsFilter:
-    """Provider interface; no scraping dependency. Unknown availability obeys fail-closed policy."""
-    def __init__(self, fail_closed: bool = True): self.fail_closed, self.available = fail_closed, False
-    def can_trade(self, symbol: str) -> bool: return self.available or not self.fail_closed
+    def __init__(self, fail_closed: bool = True):
+        self.fail_closed = fail_closed
+        self.available = False
+        self._configured = False
+    def attach_feed(self) -> None:
+        self._configured = True
+        self.available = True
+    def can_trade(self, symbol: str) -> bool:
+        if not self._configured:
+            return True
+        if self.available:
+            return True
+        return not self.fail_closed
