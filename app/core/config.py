@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     magic_number: int = 260825
     news_fail_closed: bool = True
     emergency_close_positions: bool = False
+    max_demo_volume: float = Field(default=0.10, gt=0, le=50)  # hard DEMO lot cap
 
     @field_validator("allowed_origins", "symbols", mode="before")
     @classmethod
