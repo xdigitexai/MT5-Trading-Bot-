@@ -12,8 +12,6 @@ class TradingMode(StrEnum):
 
 
 class Settings(BaseSettings):
-    # CSV values such as SYMBOLS and ALLOWED_ORIGINS are normalized by csv()
-    # below; automatic JSON decoding would reject ordinary .env CSV strings.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", enable_decoding=False)
     trading_mode: TradingMode = TradingMode.DEMO
     live_trading_enabled: bool = False
@@ -38,7 +36,13 @@ class Settings(BaseSettings):
     magic_number: int = 260825
     news_fail_closed: bool = True
     emergency_close_positions: bool = False
-    max_demo_volume: float = Field(default=0.10, gt=0, le=50)  # hard DEMO lot cap
+    max_demo_volume: float = Field(default=0.10, gt=0, le=50)
+    openai_api_key: SecretStr | None = None
+    openai_model: str = "gpt-4o-mini"
+    openai_analyst_enabled: bool = False
+    backtest_spread_points: float = Field(default=10.0, ge=0)
+    backtest_commission_per_lot: float = Field(default=7.0, ge=0)
+    backtest_slippage_points: float = Field(default=2.0, ge=0)
 
     @field_validator("allowed_origins", "symbols", mode="before")
     @classmethod
