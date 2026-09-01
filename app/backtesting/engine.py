@@ -1,18 +1,35 @@
+"""Legacy metrics + re-export expanded analytics."""
 from dataclasses import dataclass
 import numpy as np
+from app.analytics.metrics import PerformanceReport, compute_performance
 
 @dataclass(frozen=True)
 class BacktestMetrics:
-    net_profit: float; gross_profit: float; gross_loss: float; win_rate: float; profit_factor: float; expectancy: float; max_drawdown: float; trades: int
+    net_profit: float
+    gross_profit: float
+    gross_loss: float
+    win_rate: float
+    profit_factor: float
+    expectancy: float
+    max_drawdown: float
+    trades: int
 
 def metrics(pnls: list[float]) -> BacktestMetrics:
-    values = np.asarray(pnls, dtype=float)
-    if not len(values): return BacktestMetrics(0,0,0,0,0,0,0,0)
-    gross_profit=float(values[values>0].sum()); gross_loss=float(-values[values<0].sum()); equity=np.cumsum(values); peaks=np.maximum.accumulate(np.r_[0,equity])[1:]
-    return BacktestMetrics(float(values.sum()),gross_profit,gross_loss,float((values>0).mean()),gross_profit/gross_loss if gross_loss else float("inf"),float(values.mean()),float((peaks-equity).max()),len(values))
+    r = compute_performance(pnls)
+    return BacktestMetrics(
+        r.net_profit, r.gross_profit, r.gross_loss, r.win_rate,
+        r.profit_factor if r.profit_factor != float("inf") else float("inf"),
+        r.expectancy, r.max_drawdown, r.trades,
+    )
 
 def monte_carlo(pnls: list[float], iterations: int = 1000, seed: int = 7) -> dict:
-    if not pnls or iterations < 1: return {"iterations":0,"max_drawdown_range":None}
-    rng=np.random.default_rng(seed); drawdowns=[]
-    for _ in range(iterations): drawdowns.append(metrics(rng.permutation(pnls).tolist()).max_drawdown)
-    return {"iterations":iterations,"max_drawdown_range":[float(np.percentile(drawdowns,5)),float(np.percentile(drawdowns,95))]}
+    if not pnls or iterations < 1:
+        return {"iterations": 0, "max_drawdown_range": None}
+    rng = np.random.default_rng(seed)
+    drawdowns = []
+    for _ in range(iterations):
+        drawdowns.append(metrics(rng.permutation(pnls).tolist()).max_drawdown)
+    return {
+        "iterations": iterations,
+        "max_drawdown_range": [float(np.percentile(drawdowns, 5)), float(np.percentile(drawdowns, 95))],
+    }
