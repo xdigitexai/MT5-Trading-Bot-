@@ -5,6 +5,21 @@ from pydantic import BaseModel, Field
 
 class Side(StrEnum): BUY = "BUY"; SELL = "SELL"
 class SignalAction(StrEnum): BUY = "BUY"; SELL = "SELL"; HOLD = "HOLD"
+class SignalStatus(StrEnum):
+    """Lifecycle of a persisted signal, from the strategy candidate to its execution outcome.
+
+    The EXECUTED/SUBMITTED/REJECTED/FAILED/DUPLICATE values are the execution layer's statuses;
+    NEW, BLOCKED, RISK_REJECTED and ABANDONED are set by the trading loop and by reconciliation.
+    """
+    NEW = "NEW"
+    BLOCKED = "BLOCKED"
+    RISK_REJECTED = "RISK_REJECTED"
+    ABANDONED = "ABANDONED"
+    EXECUTED = "EXECUTED"
+    SUBMITTED = "SUBMITTED"
+    REJECTED = "REJECTED"
+    FAILED = "FAILED"
+    DUPLICATE = "DUPLICATE"
 
 class Signal(BaseModel):
     action: SignalAction = SignalAction.HOLD
@@ -25,6 +40,8 @@ class TradeIntent(BaseModel):
     volume: float
     requested_price: float
     idempotency_key: str
+    # Optional link back to the persisted SignalRecord; falls back to trade_id when absent.
+    signal_id: str | None = None
 
 class RiskDecision(BaseModel):
     approved: bool

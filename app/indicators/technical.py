@@ -22,3 +22,22 @@ def adx(frame: pd.DataFrame, period: int = 14) -> pd.Series:
     mdi = 100 * minus.ewm(alpha=1/period, adjust=False).mean() / value_atr
     dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
     return dx.ewm(alpha=1/period, adjust=False).mean()
+def sma(close: pd.Series, period: int) -> pd.Series: return close.rolling(period).mean()
+def bollinger(close: pd.Series, period: int = 20, mult: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+    mid = sma(close, period); width = close.rolling(period).std(ddof=0) * mult
+    return mid - width, mid, mid + width
+def roc(close: pd.Series, period: int) -> pd.Series: return (close / close.shift(period) - 1) * 100
+def donchian(frame: pd.DataFrame, period: int) -> tuple[pd.Series, pd.Series]:
+    return frame.high.rolling(period).max(), frame.low.rolling(period).min()
+def stochastic(frame: pd.DataFrame, k: int = 14, d: int = 3) -> tuple[pd.Series, pd.Series]:
+    lowest, highest = frame.low.rolling(k).min(), frame.high.rolling(k).max()
+    percent_k = 100 * (frame.close - lowest) / (highest - lowest).replace(0, np.nan)
+    return percent_k, percent_k.rolling(d).mean()
+def atr_percentile(frame: pd.DataFrame, period: int = 14, lookback: int = 100) -> pd.Series:
+    # Percentile rank of the current ATR inside its own lookback window; 1.0 is the window's most volatile point.
+    return atr(frame, period).rolling(lookback).rank(pct=True)
+def volume_series(frame: pd.DataFrame) -> pd.Series:
+    # NaN series when the feed carries neither volume column, so callers can detect an absent feed.
+    for column in ("volume", "tick_volume"):
+        if column in frame.columns: return frame[column].astype(float)
+    return pd.Series(np.nan, index=frame.index, dtype=float)

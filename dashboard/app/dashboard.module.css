@@ -1,0 +1,21 @@
+/* The only stylesheet: one animation for the alarming LIVE indicator. Everything else is inline. */
+
+@keyframes livePulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.livePulse {
+  animation: livePulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .livePulse {
+    animation: none;
+  }
+}

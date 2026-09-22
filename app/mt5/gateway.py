@@ -44,6 +44,7 @@ class MT5Gateway:
                 return item.name
         return None
     def tick(self, symbol: str): return mt5.symbol_info_tick(symbol) if self.health().connected else None
+    def symbol_info(self, symbol: str): return mt5.symbol_info(symbol) if self.health().connected else None
     def rates(self, symbol: str, timeframe: int, count: int):
         return mt5.copy_rates_from_pos(symbol, timeframe, 0, count) if self.health().connected else None
     def positions(self): return mt5.positions_get() if self.health().connected else ()
@@ -53,6 +54,10 @@ class MT5Gateway:
     def modify_position(self, ticket: int, symbol: str, stop_loss: float, take_profit: float):
         if not self.health().connected: return None
         return mt5.order_send({"action": mt5.TRADE_ACTION_SLTP, "position": ticket, "symbol": symbol, "sl": stop_loss, "tp": take_profit})
+    def cancel_order(self, order):
+        """Remove one pending order; the caller decides which tickets are its own."""
+        if not self.health().connected: return None
+        return mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket})
     def close_position(self, position):
         if not self.health().connected: return None
         tick = self.tick(position.symbol)
