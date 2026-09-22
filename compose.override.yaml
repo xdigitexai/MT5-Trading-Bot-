@@ -1,0 +1,10 @@
+# Deployment-local: keep the stack's datastores on loopback. The host already runs Redis (6379)
+# and MariaDB (3306) for the Pterodactyl panel, so private ports avoid a clash and keep PostgreSQL
+# and Redis off the public interface. Restart policies live in the tracked docker-compose.yml.
+services:
+  postgres:
+    ports: !override ["127.0.0.1:5433:5432"]
+  redis:
+    ports: !override ["127.0.0.1:6381:6379"]
+  api:
+    ports: !override ["127.0.0.1:8000:8000"]
