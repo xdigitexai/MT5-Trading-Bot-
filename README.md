@@ -24,7 +24,10 @@ one JSON file in the MT5 Common Files folder, replacing it atomically every 60 s
   time, not UTC. The bridge exports each row's raw server time, the offset it measures itself in the
   terminal (`TimeTradeServer() - TimeGMT()`, to the minute) and the UTC instant derived from them; the
   Python side recomputes `server - offset` and refuses any row where the two disagree. No fixed +2/+3
-  is assumed anywhere, so a broker DST change is followed automatically.
+  is assumed anywhere, so a broker DST change is followed automatically. Verified against known
+  release times in the live bridge: Nonfarm Payrolls and Initial Jobless Claims at 12:30 UTC (8:30 New
+  York, EDT), EIA crude stocks at 14:30 UTC, ISM manufacturing at 14:00 UTC, the SNB decision at 07:30
+  UTC and UK GDP at 06:00 UTC all land where their publishers release them.
 - **Importance** comes from MQL5's own `ENUM_CALENDAR_EVENT_IMPORTANCE` (`CALENDAR_IMPORTANCE_HIGH`,
   `_MODERATE`, `_LOW`, `_NONE`) — the raw enum name and code travel with each row, and an unmappable
   level fails the whole calendar rather than being guessed at.
@@ -33,11 +36,45 @@ one JSON file in the MT5 Common Files folder, replacing it atomically every 60 s
   a `bridge_status` other than `OK`, a missing/unreadable/malformed file, an event count that does not
   match the exported rows, or a bridge clock that disagrees with this machine's clock all mean
   `news_gate = FAIL` and no new trade. A restored calendar cache is never treated as healthy either.
-- **Deploying it.** Copy the source into the terminal's `MQL5\Experts` folder, compile it with
-  `metaeditor64.exe /compile:"<path>" /log:"<log>"` (this build reports *inverted* exit codes — a
-  successful compile returns 1 — so read the log's `Result: 0 errors` line and check the `.ex5`), and
-  make the terminal start it on launch: attach it to a chart in the terminal's last profile, or list
-  it in the terminal's startup configuration. The bridge needs no chart of its own and never trades.
+- **Deploying it.** Three steps, none of which needs a click in the terminal's GUI:
+
+  1. Copy `mql5/XdigitexCalendarBridge.mq5` into `<terminal data>\MQL5\Experts\` and compile it:
+     `metaeditor64.exe /compile:"<path to the .mq5>" /log:"<log>"`. This build reports *inverted*
+     exit codes (a successful compile returns 1, a failed one returns 0), so judge the result from
+     the log's `Result: 0 errors, 0 warnings` line and the presence of the `.ex5`.
+  2. Give the terminal a start configuration file — the `[StartUp]` section documented in the MT5
+     help, *Platform Start - For Advanced Users* — naming the bridge:
+
+        [Charts]
+        ProfileLast=Default
+
+        [Experts]
+        AllowLiveTrading=1
+        AllowDllImport=0
+        Enabled=1
+
+        [StartUp]
+        Expert=XdigitexCalendarBridge
+        Period=M1
+
+  3. Launch the terminal once with it: `terminal64.exe /config:"<path to the .ini>"`. MT5 attaches
+     the bridge to the first chart of that profile and, on shutdown, **saves the attachment into the
+     profile**, so every later plain start of the terminal restores and runs it. The terminal's own
+     Journal is the proof: `Experts  expert XdigitexCalendarBridge (EURUSDm,H1) loaded successfully`.
+
+  MT5 writes the attachment into the profile chart as this block, which is also how an operator can
+  add it by hand (the key names matter: there is no `flags`/`window_num` in this format):
+
+        <expert>
+        name=XdigitexCalendarBridge
+        path=Experts\XdigitexCalendarBridge.ex5
+        expertmode=1
+        <inputs>
+        </inputs>
+        </expert>
+
+  The bridge needs no chart of its own and never trades. A running engine must be restarted after the
+  provider change: the news provider is chosen once, when the process starts.
 
 ## Hard server-side risk limits
 
