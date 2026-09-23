@@ -296,6 +296,12 @@ class MarketScheduler:
             summary["leader"] = True
             self._run_cycle(db, summary, now)
         summary["finished_at"] = self.clock().isoformat()
+        logger.info(
+            "scheduler_heartbeat leader=%s cycle=%s skipped=%s scanned=%s candidates=%s signals=%s executions=%s duplicates=%s blocked=%s started_at=%s",
+            summary.get("leader"), self.state.cycles, bool(summary.get("skipped")), len(summary.get("symbols") or {}),
+            summary.get("candidates"), summary.get("signals"), summary.get("executions"), summary.get("duplicates"),
+            len(summary.get("blocked") or ()), summary["started_at"],
+        )
         self.state.last_cycle = summary
         return summary
 
@@ -309,6 +315,8 @@ class MarketScheduler:
         # symbol, and the gate reads the same snapshot for the whole scan.
         summary["news"] = self._refresh_news(now)
         self.state.news = summary["news"]
+        health = self.gateway.health()
+        logger.info("mt5_heartbeat connected=%s detail=%s", health.connected, health.detail)
         for symbol in self.settings.symbols:
             result = self._scan_symbol(db, symbol, now, store, summary)
             summary["symbols"][symbol] = result
@@ -581,6 +589,11 @@ class MarketScheduler:
             # The counter lives in the database, so the next process cannot start with a fresh
             # allowance of trades after a restart.
             context.store.register_trade_opened()
+            logger.info(
+                "session_trade_count trades_opened=%s max_daily_trades=%s session_loss_usd=%.2f max_session_loss_usd=%.2f",
+                context.store.trades_opened(), self.settings.max_daily_trades,
+                max(0.0, -context.store.daily_pnl()), self.settings.max_session_loss_usd,
+            )
         logger.info(
             "signal_outcome signal_id=%s symbol=%s strategy=%s status=%s volume=%s ticket=%s retcode=%s reason=%s",
             signal_id, signal.symbol, signal.strategy, outcome.status, decision.volume, outcome.order_ticket, outcome.retcode, outcome.reason,
