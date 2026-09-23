@@ -24,7 +24,7 @@ import logging
 from app.core.clock import isoformat, utcnow
 from app.core.config import Settings
 from app.database.base import AuditRecord
-from app.mt5.account import AccountProfile, account_profile
+from app.mt5.account import AccountProfile, account_matches, account_profile
 from app.mt5.constants import mt5_constants
 from app.mt5.gateway import MT5Gateway
 from app.risk.state import RiskStateStore
@@ -97,6 +97,12 @@ class BotService:
         if profile is None:
             self.gateway.shutdown()
             return self._fail("the broker account could not be read after login; refusing to start (fail closed)")
+        matched, mismatch = account_matches(profile, self.settings.mt5_login, self.settings.mt5_server)
+        if not matched:
+            self.gateway.shutdown()
+            self._set_persisted_lock(True)
+            logger.critical("bot_start_account_mismatch login=%s server=%s expected_login=%s expected_server=%s", profile.login, profile.server, self.settings.mt5_login, self.settings.mt5_server)
+            return self._fail(f"{mismatch}; the emergency lock was persisted")
         if profile.is_real:
             # A real account is reported as its own state, never downgraded by TRADING_MODE.
             logger.critical(
@@ -225,6 +231,7 @@ class BotService:
                 "max_session_loss_usd": self.settings.max_session_loss_usd,
                 "max_daily_trades": self.settings.max_daily_trades,
                 "max_open_positions": self.settings.max_open_positions,
+                "max_lots_per_position": self.settings.max_lots_per_position,
             },
         }
 

@@ -20,7 +20,7 @@ from app.core.schemas import TradeIntent
 from app.database.base import AuditRecord, ExecutionGuardRecord, SignalRecord, TradeRecord
 from app.execution.validation import validate_stops
 from app.mt5.constants import MT5Constants, mt5_constants
-from app.mt5.account import account_profile
+from app.mt5.account import account_matches, account_profile
 from app.mt5.gateway import MT5Gateway
 from app.risk.sizing import margin_within_free_margin, normalize_volume, required_margin, spec_from_symbol_info
 
@@ -188,6 +188,12 @@ class ExecutionService:
         profile = account_profile(account)
         if profile is None or not profile.classified:
             return ExecutionResult(REJECTED, "the broker account trade mode could not be verified: refusing to send", ["unverified broker account trade mode"])
+        # The terminal must still be logged in to the account the operator pinned: a silent
+        # reconnect to another account is a hard stop, checked here as well as in the risk engine.
+        matched, mismatch = account_matches(profile, settings.mt5_login, settings.mt5_server)
+        if not matched:
+            logger.critical("order_blocked_account_mismatch symbol=%s login=%s server=%s expected_login=%s expected_server=%s", signal.symbol, profile.login, profile.server, settings.mt5_login, settings.mt5_server)
+            return ExecutionResult(REJECTED, mismatch, ["broker account does not match the configured account"])
         if profile.is_real and not settings.live_orders_permitted:
             logger.critical("order_blocked_account_is_real symbol=%s trade_mode=%s live_orders_permitted=%s", signal.symbol, profile.trade_mode, settings.live_orders_permitted)
             return ExecutionResult(REJECTED, f"the connected broker account is {profile.trade_mode_label} (trade_mode={profile.trade_mode}) and live trading is not enabled", ["real account without the live gate"])

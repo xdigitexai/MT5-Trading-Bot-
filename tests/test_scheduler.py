@@ -25,14 +25,14 @@ def trading_settings(**overrides) -> Settings:
     the default here states that policy explicitly; tests that need a stricter policy override it.
 
     The fixture models a demo account that can fund a 10 000 USD balance, so the dollar risk
-    limits are scaled to it. The shipped hard limits (3 USD capital, 0.10 USD per trade, 0.30 USD
-    per session, 3 trades, 1 position) are exercised against real broker properties in
-    tests/test_hard_limits.py.
+    limits are scaled to it. The shipped hard limits (3 USD capital, 0.70 USD per trade, 1.40 USD
+    per session, 3 trades, 1 position, a 0.01 lot cap) are exercised against real broker properties
+    in tests/test_hard_limits.py.
     """
     values = {
         "symbols": ["EURUSD"], "news_fail_closed": False,
         "max_bot_capital_usd": 1_000.0, "max_loss_per_trade_usd": 50.0,
-        "max_session_loss_usd": 200.0, "max_daily_trades": 3,
+        "max_session_loss_usd": 200.0, "max_daily_trades": 3, "max_lots_per_position": 1.0,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)

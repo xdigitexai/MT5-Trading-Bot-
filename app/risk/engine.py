@@ -4,6 +4,7 @@ Every check has a name and reports its own reason; any failure means NO TRADE, a
 failure is the rejection the caller reports. The limits enforced here are hard and server-side:
 
 - ``max_loss_per_trade_usd`` is the only risk budget a volume may be derived from,
+- ``max_lots_per_position`` caps the volume itself, whatever the budget would allow,
 - ``max_bot_capital_usd`` is the allocation ceiling (not equity) the required margin must fit in,
 - ``max_session_loss_usd`` and ``max_daily_trades`` are read from the persisted risk state, so a
   restart cannot hand the loop a fresh allowance of orders,
@@ -13,6 +14,11 @@ Nothing here ever widens a limit or a stop. When the broker's minimum volume wou
 the per-trade budget at the strategy's technical stop, the trade is rejected instead of the stop
 being moved closer, and the per-trade budget is never raised to make a minimum lot fit. Routine
 rejections are returned as reasons, never raised.
+
+Fail closed is the default for every input: an unreadable account, a terminal connected to a
+different login/server than the operator configured, an unreadable risk state or a missing symbol
+specification all stop the trade instead of being assumed harmless. A session that has reached its
+loss or trade-count limit is *persisted* as a kill switch, so the verdict survives a restart.
 """
 from dataclasses import dataclass, field
 from datetime import date
@@ -20,7 +26,7 @@ import logging
 
 from app.core.config import Settings
 from app.core.schemas import Signal
-from app.mt5.account import AccountProfile
+from app.mt5.account import AccountProfile, account_matches
 from app.risk.sizing import (
     SymbolSpec,
     min_stop_distance,
@@ -36,10 +42,13 @@ logger = logging.getLogger(__name__)
 __all__ = ["RiskEngine", "SymbolSpec", "EntryFacts", "RiskAssessment", "CheckResult", "CHECK_ORDER"]
 
 # The filter chain, in the order it is evaluated. A name is stable so logs and the dry run can be
-# read against it; check 11 rejects a minimum lot that would exceed the per-trade loss budget.
+# read against it; check 3 pins the account the terminal is logged in to, check 12 rejects a
+# minimum lot that would exceed the per-trade loss budget or a volume above the hard lot cap, and
+# check 16 refuses to trade without a readable risk state.
 CHECK_ORDER: tuple[str, ...] = (
     "mt5_connected",
     "account_authorized",
+    "account_matches_expected",
     "algo_trading_enabled",
     "fresh_market_data",
     "trend_signal",
@@ -52,6 +61,7 @@ CHECK_ORDER: tuple[str, ...] = (
     "margin_within_capital",
     "margin_level",
     "total_exposure",
+    "risk_state_available",
     "loss_limits",
     "single_position",
     "symbol_position_limit",
@@ -62,6 +72,7 @@ CHECK_ORDER: tuple[str, ...] = (
 # Float tolerance for prices and money; one tenth of a point is below any broker's tick.
 _PRICE_EPSILON = 1e-12
 _MONEY_EPSILON = 1e-9
+_LOT_EPSILON = 1e-9
 
 
 def exposure_pct(notional: float, equity: float) -> float | None:
@@ -123,6 +134,9 @@ class RiskAssessment:
     risk_reward: float | None = None
     session_loss_usd: float = 0.0
     trades_opened: int = 0
+    max_lots_per_position: float | None = None
+    session_started_at: str | None = None
+    kill_switch_reason: str | None = None
 
     @property
     def failures(self) -> list[CheckResult]:
@@ -136,6 +150,10 @@ class RiskAssessment:
     @property
     def failed_checks(self) -> list[str]:
         return [check.name for check in self.failures]
+
+    @property
+    def kill_switch_active(self) -> bool:
+        return bool((self.kill_switch_reason or "").strip())
 
     def as_dict(self) -> dict:
         return {
@@ -152,6 +170,10 @@ class RiskAssessment:
             "risk_reward": self.risk_reward,
             "session_loss_usd": self.session_loss_usd,
             "trades_opened": self.trades_opened,
+            "max_lots_per_position": self.max_lots_per_position,
+            "session_started_at": self.session_started_at,
+            "kill_switch_reason": self.kill_switch_reason,
+            "kill_switch_active": self.kill_switch_active,
             "checks": [check.as_dict() for check in self.checks],
         }
 
@@ -203,15 +225,28 @@ class RiskEngine:
         session_loss = 0.0
         trades_opened = 0
         peak_equity = None
+        session_started_at = None
+        kill_switch_reason = None
         emergency_locked = bool(facts.emergency_locked)
+        # A gate with no risk state has no session history, so it cannot verify the loss or trade
+        # allowance: that is an unavailable input, never a zero-loss session.
+        risk_state_ok = state is not None
+        risk_state_reason = "" if risk_state_ok else "the persisted risk state is unavailable, so the session loss, trade count and kill switch cannot be verified"
         if state is not None:
-            row = state.load(day)
-            session_loss = max(0.0, -float(row.realized_pnl or 0.0))
-            trades_opened = int(row.trades_opened or 0)
-            peak_equity = row.peak_equity
-            emergency_locked = emergency_locked or bool(row.emergency_locked)
-            if facts.equity:
-                state.observe_equity(facts.equity, day)
+            try:
+                row = state.load(day)
+                session_loss = max(0.0, -float(row.realized_pnl or 0.0))
+                trades_opened = int(row.trades_opened or 0)
+                peak_equity = row.peak_equity
+                session_started_at = row.session_started_at
+                kill_switch_reason = row.kill_switch_reason
+                emergency_locked = emergency_locked or bool(row.emergency_locked)
+                if facts.equity:
+                    state.observe_equity(facts.equity, day)
+            except Exception as error:  # an unreadable store must never read as "no loss yet"
+                risk_state_ok = False
+                risk_state_reason = f"the persisted risk state could not be read ({type(error).__name__}), so the session loss, trade count and kill switch cannot be verified"
+                logger.error("risk_state_unreadable error=%s fail_closed=true", type(error).__name__)
 
         checks: list[CheckResult] = []
         add = checks.append
@@ -228,14 +263,39 @@ class RiskEngine:
         else:
             add(CheckResult("account_authorized", True))
 
-        # 3 algo trading enabled in the terminal
+        # 3 the live login/server is still the account the operator pinned. A terminal that
+        # reconnected to another account is a hard stop, so the mismatch is *persisted* as an
+        # emergency lock: every later cycle and every restarted process sees it, not just this one.
+        # Only an account that was really read can have "changed": an unreadable one is already
+        # refused by check 2, and latching a manual-reset lock on a transient read error would
+        # punish the operator for a hiccup that the next cycle may not even see.
+        matched, mismatch_reason = account_matches(account, settings.mt5_login, settings.mt5_server)
+        if matched:
+            add(CheckResult("account_matches_expected", True))
+        else:
+            add(CheckResult("account_matches_expected", False, mismatch_reason))
+            account_was_read = account is not None and account.classified
+            if not account_was_read:
+                logger.error("account_unverified reason=%s", mismatch_reason)
+            else:
+                if not emergency_locked:
+                    emergency_locked = True
+                if state is not None:
+                    try:
+                        state.set_emergency_locked(True, day)
+                        state.set_kill_switch(mismatch_reason, day)
+                    except Exception as error:
+                        logger.error("account_mismatch_lock_not_persisted error=%s", type(error).__name__)
+                logger.critical("account_mismatch login=%s server=%s expected_login=%s expected_server=%s reason=%s", getattr(account, "login", None), getattr(account, "server", None), settings.mt5_login, settings.mt5_server, mismatch_reason)
+
+        # 4 algo trading enabled in the terminal
         add(CheckResult("algo_trading_enabled", facts.algo_trading_enabled is True, "algorithmic trading is not enabled in the MT5 terminal (or its state is unknown)"))
 
-        # 4 fresh market data
+        # 5 fresh market data
         age = facts.data_age_seconds
         add(CheckResult("fresh_market_data", age is not None and age <= settings.market_data_max_age_seconds, f"market data is not fresh ({'unknown age' if age is None else f'{age:.0f}s old, limit {settings.market_data_max_age_seconds}s'})"))
 
-        # 5 valid trend signal
+        # 6 valid trend signal
         if side is None:
             add(CheckResult("trend_signal", False, "the strategy did not produce a BUY or SELL signal (HOLD / no trade)"))
         elif signal.score < settings.min_signal_score:
@@ -245,7 +305,7 @@ class RiskEngine:
         else:
             add(CheckResult("trend_signal", True))
 
-        # 6 momentum must not contradict the trend (HOLD is neutral; no trend means nothing to contradict)
+        # 7 momentum must not contradict the trend (HOLD is neutral; no trend means nothing to contradict)
         momentum = str(facts.momentum_action).upper() if facts.momentum_action is not None else None
         if momentum is None:
             add(CheckResult("momentum_confirmed", False, "momentum confirmation could not be computed"))
@@ -254,11 +314,11 @@ class RiskEngine:
         else:
             add(CheckResult("momentum_confirmed", False, f"momentum contradicts the trend: momentum says {momentum}, the trend signal says {side}"))
 
-        # 7 spread
+        # 8 spread
         spread_ok = facts.spread_points is not None and facts.spread_points <= settings.max_spread_points_default
         add(CheckResult("spread_within_limit", spread_ok, f"spread protection triggered (spread {facts.spread_points if facts.spread_points is not None else 'unknown'} points, limit {settings.max_spread_points_default})"))
 
-        # 8 technical stop loss, strictly on the risk side and not closer than the broker allows
+        # 9 technical stop loss, strictly on the risk side and not closer than the broker allows
         minimum = min_stop_distance(spec) if spec is not None else 0.0
         stop_reason = ""
         if spec is None:
@@ -275,7 +335,7 @@ class RiskEngine:
             stop_reason = "stop loss violates broker stop distance"
         add(CheckResult("valid_stop_loss", not stop_reason, stop_reason))
 
-        # 9 take profit present and on the right side
+        # 10 take profit present and on the right side
         tp_reason = ""
         if take_profit is None or float(take_profit or 0) <= 0:
             tp_reason = "take profit is required and must be a positive price"
@@ -285,11 +345,14 @@ class RiskEngine:
             tp_reason = "SELL take profit must be below the entry price"
         add(CheckResult("valid_take_profit", not tp_reason, tp_reason))
 
-        # 10 risk/reward, a target relationship and not a profit guarantee
+        # 11 risk/reward, a target relationship and not a profit guarantee
         ratio = settings.min_risk_reward_ratio
         add(CheckResult("risk_reward", risk_reward is not None and risk_reward >= ratio - 1e-9, f"take profit violates the {ratio:g}:1 risk/reward requirement (computed {risk_reward if risk_reward is None else round(risk_reward, 4)})"))
 
-        # 11 position sizing: derived from the loss budget and the technical stop
+        # 12 position sizing: derived from the loss budget and the technical stop, then bounded by
+        # the hard lot cap. The cap is a rejection, never a clamp: a setup whose risk-derived volume
+        # exceeds it is not silently resized, and the stop is never tightened to shrink the volume.
+        cap = float(settings.max_lots_per_position)
         sizing_reason = ""
         if spec is None or entry is None or not stop_loss or risk_distance is None:
             sizing_reason = "the stop distance is unknown, so no volume can be derived"
@@ -300,11 +363,13 @@ class RiskEngine:
                 sizing_reason = f"the broker minimum volume {spec.volume_min:g} would risk {min_lot_risk:.2f} USD at the technical stop ({stop_points:.1f} points), above the {settings.max_loss_per_trade_usd:.2f} USD per-trade limit"
             else:
                 sizing_reason = "risk-based lot sizing below broker minimum"
+        elif volume > cap + _LOT_EPSILON:
+            sizing_reason = f"the risk-derived volume {volume:g} exceeds the {cap:g} lot hard cap for a single position"
         elif risk_usd is not None and risk_usd > settings.max_loss_per_trade_usd + _MONEY_EPSILON:
             sizing_reason = f"the derived volume {volume:g} risks {risk_usd:.4f} USD, above the {settings.max_loss_per_trade_usd:.2f} USD per-trade limit"
         add(CheckResult("position_sizing", not sizing_reason, sizing_reason))
 
-        # 12 margin must fit inside the bot's capital allocation and the free margin
+        # 13 margin must fit inside the bot's capital allocation and the free margin
         margin_reason = ""
         if volume is None:
             margin_reason = "no volume was derived, so the required margin cannot be verified"
@@ -327,23 +392,40 @@ class RiskEngine:
         else:
             add(CheckResult("total_exposure", current_exposure <= settings.max_total_exposure_pct, f"total exposure limit reached ({current_exposure:.1f}% > {settings.max_total_exposure_pct}%)"))
 
-        # 13 persisted session/daily loss and trade-count limits
+        # 16 the persisted risk state has to be readable: without it the session loss, the trade
+        # count and the kill switch are unknown, and an unknown allowance is never an allowance.
+        add(CheckResult("risk_state_available", risk_state_ok, risk_state_reason))
+
+        # 17 persisted session loss, trade-count and equity limits, plus the session kill switch.
+        # Reaching either dollar limit also *persists* why the session closed, so a restarted
+        # process reads the verdict instead of recomputing a fresh allowance from zeroed counters.
         limit_reasons = []
-        if session_loss >= settings.max_session_loss_usd - _MONEY_EPSILON and session_loss > 0:
-            limit_reasons.append(f"session loss limit reached ({session_loss:.2f} USD of {settings.max_session_loss_usd:.2f} USD)")
-        if trades_opened >= settings.max_daily_trades:
-            limit_reasons.append(f"daily trade limit reached ({trades_opened} of {settings.max_daily_trades} trades)")
-        if facts.equity and session_loss >= float(facts.equity) * settings.max_daily_loss_pct / 100:
-            limit_reasons.append("daily loss limit reached")
-        if peak_equity and facts.equity and float(peak_equity) > 0 and (float(peak_equity) - float(facts.equity)) / float(peak_equity) * 100 >= settings.max_drawdown_pct:
-            limit_reasons.append("maximum drawdown emergency stop")
-            if state is not None:
-                state.set_emergency_locked(True, day)
-                emergency_locked = True
-            logger.error("risk_emergency_lock equity=%.2f peak=%s limit_pct=%s persisted=%s", float(facts.equity), peak_equity, settings.max_drawdown_pct, state is not None)
+        if risk_state_ok:
+            if session_loss >= settings.max_session_loss_usd - _MONEY_EPSILON and session_loss > 0:
+                limit_reasons.append(f"session loss limit reached ({session_loss:.2f} USD of {settings.max_session_loss_usd:.2f} USD)")
+            if trades_opened >= settings.max_daily_trades:
+                limit_reasons.append(f"daily trade limit reached ({trades_opened} of {settings.max_daily_trades} trades)")
+            if facts.equity and session_loss >= float(facts.equity) * settings.max_daily_loss_pct / 100:
+                limit_reasons.append("daily loss limit reached")
+            if peak_equity and facts.equity and float(peak_equity) > 0 and (float(peak_equity) - float(facts.equity)) / float(peak_equity) * 100 >= settings.max_drawdown_pct:
+                limit_reasons.append("maximum drawdown emergency stop")
+                if state is not None:
+                    state.set_emergency_locked(True, day)
+                    emergency_locked = True
+                    kill_switch_reason = kill_switch_reason or "maximum drawdown emergency stop"
+                    state.set_kill_switch("maximum drawdown emergency stop", day)
+                logger.error("risk_emergency_lock equity=%.2f peak=%s limit_pct=%s persisted=%s", float(facts.equity), peak_equity, settings.max_drawdown_pct, state is not None)
+        if limit_reasons:
+            kill_switch_reason = kill_switch_reason or "; ".join(limit_reasons)
+            if state is not None and risk_state_ok:
+                try:
+                    state.set_kill_switch(kill_switch_reason, day)
+                except Exception as error:
+                    logger.error("kill_switch_not_persisted error=%s", type(error).__name__)
+            logger.warning("session_kill_switch reasons=%s persisted=%s", limit_reasons, state is not None)
         add(CheckResult("loss_limits", not limit_reasons, "; ".join(limit_reasons)))
 
-        # 14 at most one position, ever
+        # 18 at most one position, ever
         open_positions = facts.open_positions
         if open_positions is None:
             add(CheckResult("single_position", False, "the number of open positions could not be verified"))
@@ -358,12 +440,16 @@ class RiskEngine:
         else:
             add(CheckResult("symbol_position_limit", symbol_positions < settings.max_positions_per_symbol, f"maximum positions per symbol reached ({symbol_positions}, limit {settings.max_positions_per_symbol})"))
 
-        # 15 no duplicate signal or order
+        # 19 no duplicate signal or order
         add(CheckResult("no_duplicate", not facts.duplicate_exists, "duplicate position or order exists"))
 
-        # 16 emergency stop inactive and the loop allowed to trade
-        if emergency_locked or not facts.trading_enabled:
-            add(CheckResult("emergency_stop_clear", False, "bot is stopped or emergency locked"))
+        # 20 emergency stop inactive, no session kill switch latched, and the loop allowed to trade
+        kill_switch_active = bool((kill_switch_reason or "").strip())
+        if emergency_locked or kill_switch_active or not facts.trading_enabled:
+            reason = "bot is stopped or emergency locked"
+            if kill_switch_active and not emergency_locked:
+                reason = f"session kill switch is latched: {kill_switch_reason}"
+            add(CheckResult("emergency_stop_clear", False, reason))
         else:
             add(CheckResult("emergency_stop_clear", True))
 
@@ -380,6 +466,9 @@ class RiskEngine:
             risk_reward=risk_reward,
             session_loss_usd=session_loss,
             trades_opened=trades_opened,
+            max_lots_per_position=cap,
+            session_started_at=session_started_at.isoformat() if session_started_at is not None else None,
+            kill_switch_reason=kill_switch_reason,
         )
         if assessment.approved:
             logger.info("risk_approved symbol=%s strategy=%s volume=%s risk_usd=%.4f margin_usd=%s", signal.symbol, signal.strategy, volume, risk_usd or 0.0, margin)

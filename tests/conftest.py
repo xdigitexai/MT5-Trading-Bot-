@@ -14,6 +14,7 @@ from app.core.schemas import Signal, SignalAction, TradeIntent
 from app.database.base import Base
 from app.mt5.gateway import MT5Health
 from app.mt5.timeframes import timeframe_minutes, timeframe_name
+from app.risk.state import RiskStateStore
 
 TRADE_RETCODE_DONE = 10009
 
@@ -214,6 +215,18 @@ def market_gateway(now: datetime | None = None, **kwargs) -> FakeGateway:
 def settings() -> Settings:
     # _env_file=None keeps the suite independent of any developer .env file.
     return Settings(_env_file=None)
+
+
+def fresh_store() -> RiskStateStore:
+    """A brand-new, empty risk state on its own private in-memory database.
+
+    The gate refuses to trade without a readable risk state, so a unit test that wants to prove
+    something *other* than that must supply one; each call here is a pristine session with no
+    realized P/L, no trades and no kill switch.
+    """
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    return RiskStateStore(sessionmaker(bind=engine)())
 
 
 @pytest.fixture

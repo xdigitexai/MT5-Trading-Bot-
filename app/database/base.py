@@ -66,10 +66,13 @@ class SignalRecord(Base):
 
 
 class RiskStateRecord(Base):
-    """Durable daily risk state.
+    """Durable session risk state.
 
     Daily-loss and peak-equity tracking must not live in process memory: a restart would silently
-    reset the limits. One row per day, and a new day inherits the previous emergency lock.
+    reset the limits. One row per day, and a new day inherits the previous emergency lock. The row
+    also carries the session's start time and, once a limit has tripped, the persisted kill-switch
+    reason, so a fresh process reads the same "this session is over" verdict instead of a fresh
+    allowance of orders.
     """
     __tablename__ = "risk_state"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -81,6 +84,9 @@ class RiskStateRecord(Base):
     # Trades opened by this bot today/session. Persisted for the same reason as realized_pnl: a
     # restart must not hand the loop a fresh allowance of orders.
     trades_opened: Mapped[int] = mapped_column(Integer, default=0)
+    # When this session's row was first created, and why the session was closed to new entries.
+    session_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    kill_switch_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

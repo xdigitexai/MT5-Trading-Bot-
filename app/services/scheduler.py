@@ -49,7 +49,7 @@ from app.database.base import ExecutionGuardRecord, SignalRecord, TradeRecord
 from app.database.runtime import SchedulerLockRecord
 from app.execution.service import ExecutionService
 from app.execution.validation import validate_stops
-from app.mt5.account import AccountProfile, account_profile
+from app.mt5.account import AccountProfile, account_matches, account_profile
 from app.mt5.gateway import MT5Gateway
 from app.news.provider import NewsProvider, build_news_provider
 from app.risk.engine import EntryFacts, RiskEngine
@@ -319,6 +319,21 @@ class MarketScheduler:
         equity = getattr(account, "equity", None)
         if equity is None or float(equity) <= 0:
             return self._block(result, cycle, "account equity is unavailable")
+        # The account identity is verified before the symbol is even scanned: if the terminal is no
+        # longer logged in to the account the operator pinned, the lock is *persisted* so every later
+        # cycle and every restarted process stops too, instead of relying on a log line.
+        identity = account_profile(account)
+        matched, mismatch = account_matches(identity, self.settings.mt5_login, self.settings.mt5_server)
+        if not matched:
+            # The account was read (the None case was blocked above), so it genuinely changed:
+            # persist the lock rather than relying on a log line.
+            logger.critical("account_mismatch login=%s server=%s expected_login=%s expected_server=%s reason=%s", getattr(identity, "login", None), getattr(identity, "server", None), self.settings.mt5_login, self.settings.mt5_server, mismatch)
+            try:
+                store.set_emergency_locked(True, now.date())
+                store.set_kill_switch(mismatch, now.date())
+            except Exception as error:
+                logger.error("account_mismatch_lock_not_persisted error=%s", type(error).__name__)
+            return self._block(result, cycle, mismatch)
         spec = spec_from_symbol_info(self.gateway.symbol_info(symbol))
         if spec is None:
             return self._block(result, cycle, "symbol specification is unavailable")

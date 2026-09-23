@@ -4,6 +4,11 @@
 broker account is. The truth about the account is ``account_info().trade_mode`` (0 = DEMO,
 1 = CONTEST, 2 = REAL), so it is read there and reported explicitly. An unreadable trade mode is
 kept as ``None`` and must be treated as "unknown", never as demo: the caller fails closed.
+
+``account_matches`` is the second half of that identity: the login and the server the terminal is
+actually connected to must still be the account the operator configured (``MT5_LOGIN`` /
+``MT5_SERVER``). A terminal that silently reconnects to another account is a hard stop, so the
+comparison is available to every layer that is about to send an order.
 """
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -95,3 +100,27 @@ def account_profile(account: Any) -> AccountProfile | None:
         leverage=_number(getattr(account, "leverage", None)),
         trade_mode=trade_mode,
     )
+
+
+def account_matches(profile: AccountProfile | None, expected_login: int | None, expected_server: str | None) -> tuple[bool, str]:
+    """Whether the live account is still the one the operator pinned, with the reason when it is not.
+
+    A configured expectation is mandatory: when ``expected_login`` or ``expected_server`` is set, a
+    missing, unreadable or different value fails. An account identity that was never configured
+    cannot have "changed unexpectedly", and a deployment that logs in at all always configures both
+    (``MT5Gateway.login`` refuses to log in without them), so the unconfigured case is not a hole in
+    the trading path - it is only reachable by a caller that never contacted the broker.
+    """
+    login_expected = expected_login is not None
+    server_expected = bool(expected_server and str(expected_server).strip())
+    if not (login_expected or server_expected):
+        return True, ""
+    if profile is None:
+        return False, "the broker account could not be read, so the expected login/server cannot be verified"
+    expected = f"{expected_login if login_expected else '-'} @ {expected_server if server_expected else '-'}"
+    if login_expected and profile.login != int(expected_login):
+        return False, f"the terminal is logged in to MT5 account {profile.login} ({profile.server}), not the expected {expected}: refusing to trade"
+    if server_expected and str(profile.server).strip().upper() != str(expected_server).strip().upper():
+        return False, f"the terminal is connected to server {profile.server}, not the expected {expected_server}: refusing to trade"
+    return True, ""
+

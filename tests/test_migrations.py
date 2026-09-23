@@ -39,6 +39,18 @@ def test_revision_chain_is_linear():
     assert callable(second.upgrade) and callable(second.downgrade)
 
 
+def test_the_dry_run_expects_the_head_of_the_migration_chain():
+    """The dry run reports a stale schema by name, so its expectation must track the chain."""
+    from app import dry_run
+
+    revisions = {path.stem: load_migration(path.stem) for path in VERSIONS.glob("0*.py")}
+    assert dry_run.EXPECTED_ALEMBIC_REVISION in revisions
+    parents = {module.down_revision for module in revisions.values() if module.down_revision}
+    heads = sorted(set(revisions) - parents)
+
+    assert heads == [dry_run.EXPECTED_ALEMBIC_REVISION]
+
+
 def unique_columns(inspector, table: str) -> set[str]:
     names = {column for index in inspector.get_indexes(table) if index.get("unique") for column in index["column_names"]}
     names |= {column for constraint in inspector.get_unique_constraints(table) for column in constraint["column_names"]}

@@ -34,13 +34,19 @@ class Settings(BaseSettings):
     # Hard server-side limits. The dollar limits are absolute ceilings on a small real-money
     # account, not percentages of equity: MAX_BOT_CAPITAL_USD is the allocation ceiling for this
     # bot (never the account's equity), and the loss limits are what the derived volume must
-    # respect. They are persisted in risk_state, so a restart cannot reset them.
+    # respect. They are persisted in risk_state, so a restart cannot reset them. Every one of them
+    # is a ceiling and never a target: the technical setup may always risk less, and a setup that
+    # cannot fit inside them is refused rather than traded with a wider stop or a looser limit.
     max_open_positions: int = Field(default=1, ge=1, le=50)
     max_positions_per_symbol: int = Field(default=1, ge=1, le=5)
     max_bot_capital_usd: float = Field(default=3.0, gt=0, le=1_000_000)
-    max_loss_per_trade_usd: float = Field(default=0.10, gt=0, le=100_000)
-    max_session_loss_usd: float = Field(default=0.30, gt=0, le=1_000_000)
+    max_loss_per_trade_usd: float = Field(default=0.70, gt=0, le=100_000)
+    max_session_loss_usd: float = Field(default=1.40, gt=0, le=1_000_000)
     max_daily_trades: int = Field(default=3, ge=1, le=10_000)
+    # Hard volume ceiling for the whole position, independent of the risk budget: a setup whose
+    # risk-derived volume would exceed it is rejected, never clamped into a bigger-than-intended
+    # position and never size-reduced by tightening the strategy's stop.
+    max_lots_per_position: float = Field(default=0.01, gt=0, le=1_000.0)
     min_signal_score: int = Field(default=75, ge=0, le=100)
     max_spread_points_default: int = Field(default=25, ge=1)
     order_deviation_points: int = Field(default=10, ge=0)

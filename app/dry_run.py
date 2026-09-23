@@ -11,7 +11,9 @@ write call, so a bug in this file cannot become an order: the report ends with t
 submitted, and it is structurally zero.
 
 The broker's symbol names are discovered at runtime (``EURUSDm`` for a broker whose majors are
-suffixed), never assumed.
+suffixed), never assumed. The risk state is read from the configured database and from nowhere
+else: a local SQLite fallback would report another store's allowance as if it were this bot's, so
+an unreachable database is reported as DOWN and judged as a REJECT instead.
 """
 import argparse
 import json
@@ -19,16 +21,14 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.core.clock import utcnow
 from app.core.config import Settings
 from app.core.schemas import SignalAction
-from app.database.base import Base
-from app.mt5.account import AccountProfile, account_profile
+from app.mt5.account import AccountProfile, account_matches, account_profile
 from app.mt5.gateway import MT5Gateway
 from app.news.provider import build_news_provider
 from app.risk.engine import EntryFacts, RiskEngine
@@ -52,7 +52,9 @@ logger = logging.getLogger("app.dry_run")
 # than being used to prove that something traded.
 VOLATILE_EXCLUSIONS = ("XNGUSD", "XAUUSD", "XAGUSD", "XTIUSD", "USOIL", "UKOIL", "BTCUSD", "ETHUSD")
 MAJORS = ("EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY")
-FALLBACK_STATE_FILE = ".dry_run_risk_state.db"
+# The schema this code expects. tests/test_migrations.py asserts it is the head of the chain, so
+# the dry run reports a stale database as "not migrated" instead of guessing from a missing table.
+EXPECTED_ALEMBIC_REVISION = "0005_session_kill_switch"
 
 
 class ReadOnlyGateway:
@@ -100,19 +102,38 @@ class SymbolEvaluation:
 
 
 def state_session_factory(settings: Settings):
-    """A session factory for the persisted risk state, or a local SQLite fallback when the app DB is down."""
-    url = settings.database_url
+    """A session factory for the persisted risk state; an unreachable database is fatal here.
+
+    Failing closed is the point: the dry run exists to report the allowance the *bot* has, so it
+    must read the configured database. Falling back to a local SQLite file would silently report a
+    different store's session loss and trade count as if they were the bot's, which is exactly the
+    kind of unverifiable input every other layer refuses.
+    """
+    engine = create_engine(settings.database_url, pool_pre_ping=True)
+    with engine.connect():
+        pass
+    return sessionmaker(bind=engine), f"configured database ({engine.dialect.name})"
+
+
+def database_report(settings: Settings) -> dict:
+    """Read-only statement of the risk-state store: reachable, dialect and migration revision."""
+    report = {"expected_revision": EXPECTED_ALEMBIC_REVISION, "revision": None, "dialect": None, "status": "DOWN", "migrated": False, "error": None}
+    engine = None
     try:
-        engine = create_engine(url, pool_pre_ping=True)
-        with engine.connect():
-            pass
-        return sessionmaker(bind=engine), f"configured database ({engine.dialect.name})"
-    except Exception as error:  # an unreachable app database must not stop a read-only report
-        logger.warning("risk_state_database_unreachable error=%s", type(error).__name__)
-        path = Path(__file__).resolve().parents[1] / FALLBACK_STATE_FILE
-        engine = create_engine(f"sqlite:///{path.as_posix()}")
-        Base.metadata.create_all(engine)
-        return sessionmaker(bind=engine), f"local sqlite fallback {path} (configured database unreachable: {type(error).__name__})"
+        engine = create_engine(settings.database_url, pool_pre_ping=True)
+        with engine.connect() as connection:
+            report["dialect"] = engine.dialect.name
+            report["revision"] = connection.execute(text("select version_num from alembic_version")).scalar()
+            report["status"] = "UP"
+            report["migrated"] = report["revision"] == EXPECTED_ALEMBIC_REVISION
+            if not report["migrated"]:
+                report["error"] = f"the database is at migration {report['revision']}, not {EXPECTED_ALEMBIC_REVISION}"
+    except Exception as error:
+        report["error"] = f"{type(error).__name__}: {error}"
+    finally:
+        if engine is not None:
+            engine.dispose()
+    return report
 
 
 def candidate_symbols(settings: Settings, gateway) -> list[str]:
@@ -158,7 +179,11 @@ def technical_preview(spec, frames: dict, tick, settings: Settings, leverage: fl
     entry = tick.ask if side == "BUY" else tick.bid
     stop = entry - distance if side == "BUY" else entry + distance
     target = entry + 2 * distance if side == "BUY" else entry - 2 * distance
+    cap = float(settings.max_lots_per_position)
     volume = size_for_loss_budget(settings.max_loss_per_trade_usd, entry, stop, spec)
+    reason = ""
+    if volume is not None and volume > cap:
+        reason = f"the risk-derived volume {volume:g} exceeds the {cap:g} lot hard cap, so the setup would be refused rather than resized"
     return {
         "note": "illustrative arithmetic at the strategy's ATR stop, on the side the H4/H1 EMAs lean towards; not a signal",
         "side": side,
@@ -178,7 +203,10 @@ def technical_preview(spec, frames: dict, tick, settings: Settings, leverage: fl
         "risk_reward": 2.0,
         "max_loss_per_trade_usd": settings.max_loss_per_trade_usd,
         "max_bot_capital_usd": settings.max_bot_capital_usd,
-        "within_budget": bool(volume) and position_risk(volume, entry, stop, spec) <= settings.max_loss_per_trade_usd,
+        "max_lots_per_position": cap,
+        "within_cap": bool(volume) and volume <= cap,
+        "reason": reason,
+        "within_budget": bool(volume) and volume <= cap and position_risk(volume, entry, stop, spec) <= settings.max_loss_per_trade_usd,
     }
 
 
@@ -308,20 +336,36 @@ def money(value, digits: int = 4) -> str:
 
 def build_report(settings: Settings, gateway, now: datetime) -> dict:
     profile: AccountProfile | None = account_profile(gateway.account_info())
+    matched, mismatch = account_matches(profile, settings.mt5_login, settings.mt5_server)
     risk = RiskEngine(settings)
-    session_factory, state_detail = state_session_factory(settings)
-    db = session_factory()
+    database = database_report(settings)
+    session_factory = None
+    state_detail = f"unavailable ({database['error']})"
+    row = None
+    session_realized, trades_opened, emergency_locked = 0.0, 0, False
+    session_started_at, kill_switch_reason = None, None
+    evaluations: list[SymbolEvaluation] = []
     try:
-        store = RiskStateStore(db)
-        row = store.load()
-        session_realized = float(row.realized_pnl or 0.0)
-        trades_opened = int(row.trades_opened or 0)
-        emergency_locked = bool(row.emergency_locked)
-        scheduler = MarketScheduler(settings, gateway, session_factory, news=build_news_provider(settings))
-        symbols = candidate_symbols(settings, gateway)
-        evaluations = [evaluate_symbol(gateway, scheduler, risk, settings, symbol, now, store) for symbol in symbols]
-    finally:
-        db.close()
+        session_factory, state_detail = state_session_factory(settings)
+        db = session_factory()
+        try:
+            store = RiskStateStore(db)
+            row = store.load()
+            session_realized = float(row.realized_pnl or 0.0)
+            trades_opened = int(row.trades_opened or 0)
+            emergency_locked = bool(row.emergency_locked)
+            session_started_at = row.session_started_at
+            kill_switch_reason = row.kill_switch_reason
+            scheduler = MarketScheduler(settings, gateway, session_factory, news=build_news_provider(settings))
+            symbols = candidate_symbols(settings, gateway)
+            evaluations = [evaluate_symbol(gateway, scheduler, risk, settings, symbol, now, store) for symbol in symbols]
+        finally:
+            db.close()
+    except Exception as error:  # no risk state means no allowance, and the report says so
+        logger.error("dry_run_risk_state_unavailable error=%s", type(error).__name__)
+        database["status"] = "DOWN"
+        database["error"] = f"{type(error).__name__}: {error}"
+        state_detail = f"unavailable ({type(error).__name__})"
 
     chosen = select(evaluations)
     assessment = (chosen.assessment if chosen else None) or {}
@@ -340,12 +384,22 @@ def build_report(settings: Settings, gateway, now: datetime) -> dict:
             "confirmation_strategy": "momentum (confirmation only)",
             "magic_number": settings.magic_number,
         },
+        "live_gates": {
+            "trading_mode": settings.trading_mode.value,
+            "live_trading_enabled": settings.live_trading_enabled,
+            "live_orders_permitted": settings.live_orders_permitted,
+            "orders_authorized": False,
+            "changes_applied": [],
+            "note": "these two values are what a live run would need; this run changed neither, and enabling them requires explicit operator authorization",
+        },
+        "database": database,
         "hard_limits": {
             "max_bot_capital_usd": settings.max_bot_capital_usd,
             "max_loss_per_trade_usd": settings.max_loss_per_trade_usd,
             "max_session_loss_usd": settings.max_session_loss_usd,
             "max_daily_trades": settings.max_daily_trades,
             "max_open_positions": settings.max_open_positions,
+            "max_lots_per_position": settings.max_lots_per_position,
         },
         "account": {
             **(profile.as_dict() if profile else {}),
@@ -354,14 +408,23 @@ def build_report(settings: Settings, gateway, now: datetime) -> dict:
             "authorized_for_orders": bool(profile and profile.is_real and settings.live_orders_permitted) or bool(profile and not profile.is_real),
             "algo_trading_enabled": None if terminal is None else bool(getattr(terminal, "trade_allowed", False)),
             "company": profile.company if profile else None,
+            "expected_login": settings.mt5_login,
+            "expected_server": settings.mt5_server,
+            "matches_expected": bool(matched),
+            "mismatch_reason": mismatch,
         },
         "session": {
             "state_source": state_detail,
-            "day": row.day.isoformat(),
+            "available": session_factory is not None,
+            "day": row.day.isoformat() if row is not None else None,
+            "session_started_at": session_started_at.isoformat() if session_started_at is not None else None,
             "realized_pnl_usd": session_realized,
             "session_loss_usd": max(0.0, -session_realized),
             "trades_opened": trades_opened,
+            "max_daily_trades": settings.max_daily_trades,
+            "max_session_loss_usd": settings.max_session_loss_usd,
             "emergency_locked": emergency_locked,
+            "kill_switch_reason": kill_switch_reason,
         },
         "symbols_evaluated": [
             {
@@ -388,6 +451,7 @@ def build_report(settings: Settings, gateway, now: datetime) -> dict:
             "minimum_lot_risk_usd": assessment.get("min_lot_risk_usd"),
             "required_margin_usd": assessment.get("margin_usd"),
             "bot_capital_usd": settings.max_bot_capital_usd,
+            "max_lots_per_position": settings.max_lots_per_position,
         },
         "verdict": "REJECT",
         "reason": "no symbol could be evaluated",
@@ -395,14 +459,20 @@ def build_report(settings: Settings, gateway, now: datetime) -> dict:
     }
 
     guard_reason = None
-    if chosen is None:
-        report["reason"] = "no configured symbol could be resolved, priced and analysed"
+    if not matched:
+        guard_reason = f"the terminal account could not be verified: {mismatch}"
+    elif database["status"] != "UP":
+        guard_reason = f"the risk-state database is unreachable, so no allowance can be verified ({database['error']})"
+    elif not database["migrated"]:
+        guard_reason = f"the risk-state schema is not at {EXPECTED_ALEMBIC_REVISION} ({database['error']})"
+    elif chosen is None:
+        guard_reason = "no configured symbol could be resolved, priced and analysed"
     elif chosen.assessment is None:
         guard_reason = chosen.reason or "the symbol could not be evaluated"
     elif not assessment.get("approved"):
         guard_reason = assessment.get("reason")
     elif chosen.news and not chosen.news.get("allowed"):
-        guard_reason = f"news policy (app-level guard outside the 16 checks): {chosen.news.get('reason')}"
+        guard_reason = f"news policy (app-level guard outside the ordered checks): {chosen.news.get('reason')}"
 
     if guard_reason is None:
         report["verdict"] = "PASS"
@@ -416,8 +486,11 @@ def build_report(settings: Settings, gateway, now: datetime) -> dict:
 def render(report: dict) -> str:
     account, limits = report["account"], report["hard_limits"]
     session, selection = report["session"], report["selection"]
+    database = report.get("database") or {}
+    live = report.get("live_gates") or report["bot"]
     risk, signal, levels, spec = selection["risk"], selection["signal"], selection["levels"], selection["symbol_spec"]
     preview = levels.get("preview") or {}
+    cap = limits.get("max_lots_per_position")
     lines = [
         "MT5 HARD-LIMIT DRY RUN (read-only: no order is ever sent)",
         "=" * 68,
@@ -427,18 +500,26 @@ def render(report: dict) -> str:
         f"free margin / leverage  : {money(account.get('free_margin'), 2)} / 1:{money(account.get('leverage'), 0)}",
         f"detected trade mode     : {account.get('trade_mode_label')} (trade_mode={account.get('trade_mode')})"
         + ("  <-- REAL MONEY ACCOUNT" if account.get("is_real") else ""),
+        f"expected account        : {account.get('expected_login')} / {account.get('expected_server')} -> matches_expected={account.get('matches_expected')}",
         f"bot mode / live gate    : {report['bot']['trading_mode']} / live_orders_permitted={report['bot']['live_orders_permitted']}",
         f"terminal algo trading   : {account.get('algo_trading_enabled')}",
         "",
-        "HARD LIMITS (server-side)",
+        "DATABASE / MIGRATIONS",
+        f"  status                : {database.get('status')} ({database.get('dialect') or 'n/a'})",
+        f"  alembic revision      : {database.get('revision')} (expected {database.get('expected_revision')}, migrated={database.get('migrated')})",
+        f"  detail                : {database.get('error') or 'ok'}",
+        "",
+        "HARD LIMITS (server-side ceilings, never targets)",
         f"  bot capital allocation: {money(limits['max_bot_capital_usd'], 2)} USD (allocation ceiling, not equity)",
         f"  max loss per trade    : {money(limits['max_loss_per_trade_usd'], 2)} USD",
         f"  max session loss      : {money(limits['max_session_loss_usd'], 2)} USD",
         f"  max trades per session: {limits['max_daily_trades']}",
         f"  max simultaneous pos. : {limits['max_open_positions']}",
-        f"session realized P/L    : {money(session['realized_pnl_usd'], 4)} USD (loss {money(session['session_loss_usd'], 4)} USD), "
-        f"trades opened {session['trades_opened']}, emergency lock {session['emergency_locked']}",
-        f"session state source    : {session['state_source']}",
+        f"  max lots per position : {money(cap, 4)}",
+        f"session realized P/L    : {money(session.get('realized_pnl_usd'), 4)} USD (loss {money(session.get('session_loss_usd'), 4)} USD)",
+        f"session trades / start  : {session.get('trades_opened')} of {session.get('max_daily_trades')} | started {session.get('session_started_at')} (day {session.get('day')})",
+        f"kill switch / lock      : {session.get('kill_switch_reason') or 'not latched'} | emergency lock {session.get('emergency_locked')}",
+        f"session state source    : {session.get('state_source')}",
         "",
         f"strategy enabled        : {report['bot']['enabled_strategies']} (primary {report['bot']['primary_strategy']})",
         f"symbol selected         : {selection['symbol']}",
@@ -456,7 +537,7 @@ def render(report: dict) -> str:
         f"technical SL            : {money(levels.get('stop_loss'), 5)}",
         f"take profit             : {money(levels.get('take_profit'), 5)}",
         f"risk/reward             : {money(risk.get('risk_reward'), 3)} : 1 (target only, not a profit guarantee)",
-        f"calculated safe lot     : {money(risk.get('volume'), 4)}",
+        f"calculated safe lot     : {money(risk.get('volume'), 4)} (hard cap {money(risk.get('max_lots_per_position') or cap, 4)})",
         f"expected loss at SL     : {money(risk.get('risk_usd'), 4)} USD (limit {money(limits['max_loss_per_trade_usd'], 2)} USD)",
         f"broker-minimum-lot risk : {money(risk.get('min_lot_risk_usd'), 4)} USD at the same technical stop",
         f"required margin         : {money(selection.get('required_margin_usd'), 4)} USD (allocation {money(selection.get('bot_capital_usd'), 2)} USD)",
@@ -468,8 +549,9 @@ def render(report: dict) -> str:
         f"  stop distance         : {money(preview.get('stop_distance_points'), 1)} points ({money(preview.get('stop_distance_price'), 5)} price)",
         f"  risk per lot          : {money(preview.get('risk_per_lot_usd'), 4)} USD",
         f"  broker minimum lot    : {money(spec.get('volume_min'), 4)} -> {money(preview.get('minimum_volume_risk_usd'), 4)} USD at this stop"
-        + ("  <-- EXCEEDS the 0.10 USD budget, so no trade" if (preview.get("minimum_volume_risk_usd") or 0) > limits["max_loss_per_trade_usd"] else ""),
+        + (f"  <-- EXCEEDS the {money(limits['max_loss_per_trade_usd'], 2)} USD budget, so no trade" if (preview.get("minimum_volume_risk_usd") or 0) > limits["max_loss_per_trade_usd"] else ""),
         f"  calculated safe lot   : {money(preview.get('volume'), 4)} -> loss {money(preview.get('volume_risk_usd'), 4)} USD, margin {money(preview.get('margin_usd'), 4)} USD",
+        f"  hard lot cap          : {money(preview.get('max_lots_per_position'), 4)} -> within_cap={preview.get('within_cap')} {preview.get('reason') or ''}".rstrip(),
         f"  minimum-lot margin    : {money(preview.get('minimum_lot_margin_usd'), 4)} USD (allocation {money(limits['max_bot_capital_usd'], 2)} USD)",
         f"  inside the hard limits: {preview.get('within_budget')}",
         f"  open positions        : {levels.get('open_positions_managed')} bot-managed / {levels.get('open_positions_total')} total on the account",
@@ -486,6 +568,13 @@ def render(report: dict) -> str:
     for item in report["symbols_evaluated"]:
         lines.append(f"  {item['symbol']:<10} {item['status']:<8} {str(item['action']):<5} score={item['score']} spread={money(item['spread_points'], 1)}pt  {item['reason']}")
     lines += [
+        "",
+        "LIVE GATES (read-only statement: this run changed nothing)",
+        f"  current  : TRADING_MODE={live.get('trading_mode')}  LIVE_TRADING_ENABLED={str(live.get('live_trading_enabled')).lower()}"
+        f"  -> live_orders_permitted={live.get('live_orders_permitted')}",
+        "  proposed : TRADING_MODE=live  LIVE_TRADING_ENABLED=true  -> live_orders_permitted=True",
+        "  action   : REQUIRES EXPLICIT AUTHORIZATION. Neither variable was changed by this run;",
+        "             every order below is refused while the gates read demo/false.",
         "",
         "=" * 68,
         f"VERDICT: {report['verdict']}",
