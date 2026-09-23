@@ -21,6 +21,7 @@ from app.execution.service import ExecutionService
 from app.mt5.account import account_matches
 from app.mt5.gateway import MT5Gateway
 from app.news.provider import SqlNewsCache, build_news_provider
+from app.risk.authorization import authorization_state
 from app.risk.state import RiskStateStore
 from app.services.analytics import performance as performance_summary
 from app.services.analytics import statistics as statistics_summary
@@ -186,7 +187,8 @@ def strategies(config: Settings = Depends(current_settings)):
 
 @app.get("/api/risk", dependencies=[Depends(auth)])
 def risk(db: Session = Depends(get_db)):
-    row = RiskStateStore(db).load()
+    store = RiskStateStore(db)
+    row = store.load()
     return {
         "risk_per_trade_pct": settings.risk_per_trade_pct,
         "max_daily_loss_pct": settings.max_daily_loss_pct,
@@ -205,6 +207,7 @@ def risk(db: Session = Depends(get_db)):
         "peak_equity": row.peak_equity,
         "mode": settings.trading_mode.value,
         "live_orders_permitted": settings.live_orders_permitted,
+        "one_trade_authorization": authorization_state(settings, store).as_dict(),
     }
 
 
@@ -236,8 +239,9 @@ def operational_status(db: Session = Depends(get_db)):
     database_ok, database_detail = _database_healthy(db)
     risk = None
     risk_ok, risk_detail = False, "the persisted risk state could not be read"
+    store = RiskStateStore(db)
     try:
-        row = RiskStateStore(db).load()
+        row = store.load()
         risk_ok = True
         risk_detail = ""
         risk = {
@@ -288,6 +292,11 @@ def operational_status(db: Session = Depends(get_db)):
         },
         "live_orders_permitted": settings.live_orders_permitted,
         "trading_mode": settings.trading_mode.value,
+        # The effective live-ordering state of the order gate: the configuration above *and* the
+        # owner's single unspent live trade. `trading_mode` stays `live` either way, so
+        # reconciliation, analytics, the MT5 monitor and the dashboard keep working after the one
+        # authorized trade has been reserved.
+        "one_trade_authorization": authorization_state(settings, store).as_dict(),
         "positions": {
             "open": None if managed is None else len(managed),
             "readable": positions is not None,

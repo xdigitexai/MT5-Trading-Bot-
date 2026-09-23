@@ -5,14 +5,23 @@ stored in ``risk_state`` so that a process restart cannot silently reset the ses
 trade allowance, the drawdown limit or the kill switch. A new trading day inherits the previous
 day's emergency lock and peak equity, but not the session-scoped kill switch: that one closes the
 session it was raised in, and the next session starts with a fresh allowance.
+
+The owner's one-live-trade authorization lives here too, but *outside* the per-day rows: it is a
+single row (``one_trade_authorization``) reserved by one conditional UPDATE, so it is spent at most
+once for the whole deployment - not once per day, per session, per process or per restart - and
+re-arming it takes an explicit manual call, never a new day or a new process.
 """
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.database.base import RiskStateRecord
+from app.database.base import OneTradeAuthorizationRecord, RiskStateRecord
+
+# The authorization is one fixed row: a known id is what lets the reservation be a plain UPDATE.
+ONE_TRADE_AUTHORIZATION_ID = 1
 
 
 @dataclass(frozen=True)
@@ -128,3 +137,63 @@ class RiskStateStore:
 
     def daily_pnl(self, day: date | None = None) -> float:
         return float(self.load(day).realized_pnl or 0.0)
+
+    # ------------------------------------------------------------------ the single live trade
+
+    def one_trade_authorization(self) -> OneTradeAuthorizationRecord:
+        """The one live-trade authorization, materialised on first use and never cleared here.
+
+        The migration creates the row, so in a migrated deployment this is a plain read; the insert
+        only happens on a schema built from the models (tests) or if the row was removed, and then it
+        is inserted *unconsumed* because a missing authorization is one that was never spent.
+        """
+        row = self.db.get(OneTradeAuthorizationRecord, ONE_TRADE_AUTHORIZATION_ID)
+        if row is not None: return row
+        row = OneTradeAuthorizationRecord(id=ONE_TRADE_AUTHORIZATION_ID, consumed=False)
+        self.db.add(row)
+        try:
+            self.db.commit()
+        except IntegrityError:  # another process inserted it first: the row, not the outcome, was the race
+            self.db.rollback()
+            row = self.db.get(OneTradeAuthorizationRecord, ONE_TRADE_AUTHORIZATION_ID)
+            if row is None: raise
+        self.db.refresh(row)
+        return row
+
+    def one_trade_authorization_consumed(self) -> bool:
+        """Whether the one authorized live trade has already been reserved."""
+        return bool(self.one_trade_authorization().consumed)
+
+    def consume_one_trade_authorization(self, trade_id: str = "", reason: str = "") -> bool:
+        """Reserve the one authorized live trade; True only for the caller that won the race.
+
+        One conditional statement is the whole race defence: ``consumed = true`` is applied only
+        where it is still false, so a rowcount of one means *this* caller flipped it and every other
+        caller - a second scheduler cycle, a duplicate engine process or a process racing its own
+        restart - reads zero and must not send. A failed send does not return the reservation:
+        spending it is the fail-closed direction, and re-arming is a deliberate manual act.
+        """
+        self.one_trade_authorization()  # materialise before the UPDATE, so the UPDATE is not the race
+        moment = datetime.now(timezone.utc)
+        result = self.db.execute(
+            update(OneTradeAuthorizationRecord)
+            .where(OneTradeAuthorizationRecord.id == ONE_TRADE_AUTHORIZATION_ID, OneTradeAuthorizationRecord.consumed.is_(False))
+            .values(consumed=True, consumed_at=moment, consumed_trade_id=trade_id or None, consumed_reason=reason or None, updated_at=moment)
+        )
+        self.db.commit()
+        return result.rowcount == 1
+
+    def authorize_one_trade(self, reason: str = "") -> OneTradeAuthorizationRecord:
+        """Manual re-authorization: clear the consumed flag for exactly one more live trade.
+
+        Nothing automated calls this. The operator does, deliberately, having decided to allow one
+        more live entry; the previous consumption is overwritten with the new reason.
+        """
+        row = self.one_trade_authorization()
+        row.consumed = False
+        row.consumed_at = None
+        row.consumed_trade_id = None
+        row.consumed_reason = str(reason) or None
+        self.db.commit()
+        self.db.refresh(row)
+        return row

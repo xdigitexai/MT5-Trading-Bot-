@@ -102,6 +102,18 @@ never targets**: the bot risks less whenever the technical setup allows it.
 - The session loss, the trade counter, the session start and the kill-switch latch live in the
   `risk_state` table, so a restart cannot reset them. Reaching the session-loss limit or the trade
   limit persists *why* the session closed to new entries.
+- **Exactly one live trade per authorization.** The owner's single live entry lives in its own
+  `one_trade_authorization` row (its own table, because it is one decision for the whole deployment
+  and not one per day). It is reserved by a conditional `UPDATE ... WHERE consumed = false` in the
+  same step that authorizes the send - before the order exists - so of two cycles, two engine
+  processes or a process racing its own restart exactly one may reach the broker, and the risk chain
+  refuses every later entry by name (`one_trade_authorization`). A restart, a reboot, a scheduler
+  restart and a new calendar day all read the same spent row: this is deliberately *not*
+  `MAX_DAILY_TRADES`, which resets tomorrow. Nothing automated clears it, and `TRADING_MODE` stays
+  `live` while ordered entries are refused, so reconciliation, analytics, the MT5 monitor and the
+  dashboard keep working. `GET /api/status` and `GET /api/risk` report it under
+  `one_trade_authorization` (`consumed`, `consumed_trade_id`, `ordering_enabled`); re-arming one more
+  trade is a deliberate operator act (`RiskStateStore.authorize_one_trade`), never an automatic one.
 - Every order carries a broker-side stop loss (from the strategy's own ATR level, never an
   arbitrary dollar distance) and a take profit of at least 1:2.
 - Immediately after a fill the position is read back from MT5 and compared with the approved
@@ -182,9 +194,9 @@ Start-ScheduledTask -TaskName "MT5TradingBotEngine"
 `GET /api/status` (bearer token) answers in one call: engine state, MT5 connectivity, the account
 and whether it is the pinned one, the account's real/demo trade mode, database and risk-store
 health, the calendar provider's health and **data age**, the scheduler's heartbeat and whether this
-process is the single leader, `live_orders_permitted`, the open-position count, the session realized
-P/L, trades used / `MAX_DAILY_TRADES` and the kill-switch state. No credential appears in it or in
-any log line.
+process is the single leader, `live_orders_permitted`, the effective `one_trade_authorization` state
+(`consumed` and `ordering_enabled`), the open-position count, the session realized P/L, trades used /
+`MAX_DAILY_TRADES` and the kill-switch state. No credential appears in it or in any log line.
 
 Exactly one process may turn a candle into an order: the market loop holds a lease row in
 `scheduler_locks` for its whole lifetime, so a second engine is a standby that never scans. Verify

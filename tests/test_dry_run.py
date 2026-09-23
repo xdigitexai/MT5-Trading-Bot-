@@ -102,4 +102,5 @@ def test_the_dry_run_reports_a_stale_schema_as_a_rejection(monkeypatch, session_
 
     report = dry_run.build_report(hard_settings(), gateway, now)
 
-    assert report["verdict"] == "REJECT" and "not at 0006_news_calendar" in report["reason"]
+    # The expectation tracks the head of the migration chain, so this test does not pin a revision.
+    assert report["verdict"] == "REJECT" and f"not at {dry_run.EXPECTED_ALEMBIC_REVISION}" in report["reason"]

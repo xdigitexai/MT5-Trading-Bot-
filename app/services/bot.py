@@ -27,6 +27,7 @@ from app.database.base import AuditRecord
 from app.mt5.account import AccountProfile, account_matches, account_profile
 from app.mt5.constants import mt5_constants
 from app.mt5.gateway import MT5Gateway
+from app.risk.authorization import AuthorizationState, authorization_state
 from app.risk.state import RiskStateStore
 from app.services.scheduler import MarketScheduler
 
@@ -221,6 +222,10 @@ class BotService:
             "scheduler": self.scheduler.status() if self.scheduler is not None else None,
             "mode": self.settings.trading_mode.value,
             "live_orders_permitted": self.settings.live_orders_permitted,
+            # The effective live-ordering state: the gate above AND the owner's single unspent live
+            # trade. The mode stays `live` after the one authorized trade is reserved, so this is
+            # what says whether another live entry may still be authorized.
+            "one_trade_authorization": self._authorization().as_dict(),
             # The account's own trade mode, reported next to (never replaced by) the bot's mode.
             "account": profile.as_dict() if profile is not None else None,
             "account_trade_mode": profile.trade_mode_label if profile is not None else "UNKNOWN",
@@ -260,6 +265,17 @@ class BotService:
         except Exception as error:  # unreadable state must never be read as "unlocked"
             logger.error("risk_state_unreadable error=%s", type(error).__name__)
             return None
+
+    def _authorization(self) -> AuthorizationState:
+        """The persisted single live-trade authorization; an unreadable one is never an unspent one."""
+        if self.session_factory is None:
+            return authorization_state(self.settings, None)
+        try:
+            with self._session() as db:
+                return authorization_state(self.settings, RiskStateStore(db))
+        except Exception as error:
+            logger.error("one_trade_authorization_unreadable error=%s", type(error).__name__)
+            return AuthorizationState(live_orders_permitted=bool(self.settings.live_orders_permitted))
 
     def _set_persisted_lock(self, locked: bool) -> bool:
         if self.session_factory is None:

@@ -90,6 +90,25 @@ class RiskStateRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class OneTradeAuthorizationRecord(Base):
+    """The single live-trade authorization: one row for the whole deployment, spent at most once.
+
+    The owner authorized *exactly one* live trade. That is one decision, not one per day, so it is
+    deliberately not a column of the per-day ``risk_state`` rows: a new calendar day, a restart, a
+    scheduler restart or a reboot must not hand the loop a second one. Consuming it is a conditional
+    single-statement UPDATE on this row, which is what makes two concurrent cycles (or two engine
+    processes) unable to both send an order. Re-arming it takes a separate, explicit manual
+    authorization - no automated path ever clears ``consumed``.
+    """
+    __tablename__ = "one_trade_authorization"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    consumed: Mapped[bool] = mapped_column(Boolean, default=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    consumed_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
 class ExecutionGuardRecord(Base):
     """Idempotency fence: the unique key makes a second order for the same intent impossible."""
     __tablename__ = "execution_guards"

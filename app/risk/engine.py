@@ -8,7 +8,10 @@ failure is the rejection the caller reports. The limits enforced here are hard a
 - ``max_bot_capital_usd`` is the allocation ceiling (not equity) the required margin must fit in,
 - ``max_session_loss_usd`` and ``max_daily_trades`` are read from the persisted risk state, so a
   restart cannot hand the loop a fresh allowance of orders,
-- ``max_open_positions`` is 1: no second position, no averaging, no grid.
+- ``max_open_positions`` is 1: no second position, no averaging, no grid,
+- ``one_trade_authorization`` is the owner's single live trade: live ordering is permitted only
+  while that persisted authorization is unspent, so a spent one refuses every later entry even
+  though ``TRADING_MODE`` stays ``live`` (reconciliation, analytics and monitoring keep running).
 
 Nothing here ever widens a limit or a stop. When the broker's minimum volume would risk more than
 the per-trade budget at the strategy's technical stop, the trade is rejected instead of the stop
@@ -27,6 +30,7 @@ import logging
 from app.core.config import Settings
 from app.core.schemas import Signal
 from app.mt5.account import AccountProfile, account_matches
+from app.risk.authorization import CHECK_NAME as AUTHORIZATION_CHECK, authorization_state
 from app.risk.sizing import (
     SymbolSpec,
     min_stop_distance,
@@ -43,8 +47,9 @@ __all__ = ["RiskEngine", "SymbolSpec", "EntryFacts", "RiskAssessment", "CheckRes
 
 # The filter chain, in the order it is evaluated. A name is stable so logs and the dry run can be
 # read against it; check 3 pins the account the terminal is logged in to, check 12 rejects a
-# minimum lot that would exceed the per-trade loss budget or a volume above the hard lot cap, and
-# check 16 refuses to trade without a readable risk state.
+# minimum lot that would exceed the per-trade loss budget or a volume above the hard lot cap, check
+# 16 refuses to trade without a readable risk state, and check 17 refuses a live order once the
+# owner's single live-trade authorization has been spent.
 CHECK_ORDER: tuple[str, ...] = (
     "mt5_connected",
     "account_authorized",
@@ -62,6 +67,7 @@ CHECK_ORDER: tuple[str, ...] = (
     "margin_level",
     "total_exposure",
     "risk_state_available",
+    "one_trade_authorization",
     "loss_limits",
     "single_position",
     "symbol_position_limit",
@@ -396,7 +402,15 @@ class RiskEngine:
         # count and the kill switch are unknown, and an unknown allowance is never an allowance.
         add(CheckResult("risk_state_available", risk_state_ok, risk_state_reason))
 
-        # 17 persisted session loss, trade-count and equity limits, plus the session kill switch.
+        # 17 the owner's single live-trade authorization. ONE live entry may ever be authorized, and
+        # the reservation is persisted, so the refusal holds on the next cycle, after a restart, a
+        # reboot or a new calendar day - and, unlike MAX_DAILY_TRADES, it does not reset tomorrow.
+        # Only *ordering* is refused here: TRADING_MODE stays `live`, so the loop keeps scanning and
+        # reporting, and reconciliation, analytics, the MT5 monitor and the dashboard keep working.
+        authorization = authorization_state(settings, state)
+        add(CheckResult(AUTHORIZATION_CHECK, not authorization.blocked, authorization.blocked_reason))
+
+        # 18 persisted session loss, trade-count and equity limits, plus the session kill switch.
         # Reaching either dollar limit also *persists* why the session closed, so a restarted
         # process reads the verdict instead of recomputing a fresh allowance from zeroed counters.
         limit_reasons = []
@@ -425,7 +439,7 @@ class RiskEngine:
             logger.warning("session_kill_switch reasons=%s persisted=%s", limit_reasons, state is not None)
         add(CheckResult("loss_limits", not limit_reasons, "; ".join(limit_reasons)))
 
-        # 18 at most one position, ever
+        # 19 at most one position, ever
         open_positions = facts.open_positions
         if open_positions is None:
             add(CheckResult("single_position", False, "the number of open positions could not be verified"))
@@ -440,10 +454,10 @@ class RiskEngine:
         else:
             add(CheckResult("symbol_position_limit", symbol_positions < settings.max_positions_per_symbol, f"maximum positions per symbol reached ({symbol_positions}, limit {settings.max_positions_per_symbol})"))
 
-        # 19 no duplicate signal or order
+        # 20 no duplicate signal or order
         add(CheckResult("no_duplicate", not facts.duplicate_exists, "duplicate position or order exists"))
 
-        # 20 emergency stop inactive, no session kill switch latched, and the loop allowed to trade
+        # 21 emergency stop inactive, no session kill switch latched, and the loop allowed to trade
         kill_switch_active = bool((kill_switch_reason or "").strip())
         if emergency_locked or kill_switch_active or not facts.trading_enabled:
             reason = "bot is stopped or emergency locked"

@@ -1,9 +1,12 @@
 """Order execution.
 
 Everything here fails closed. An order is only sent when the stop loss is validated, the symbol
-specification is known, the account margin can be verified and the idempotency key is reserved
-in the database; the reservation uses a unique constraint so the same signal can never produce
-a second order. A gateway error or an ambiguous response is recorded and never retried blindly.
+specification is known, the account margin can be verified, the owner's single live-trade
+authorization is reserved and the idempotency key is reserved in the database; the key reservation
+uses a unique constraint and the authorization uses a rowcount-checked conditional UPDATE, so the
+same signal can never produce a second order and two processes racing the same live authorization
+cannot both reach the broker. A gateway error or an ambiguous response is recorded and never
+retried blindly.
 """
 import json
 import logging
@@ -22,7 +25,9 @@ from app.execution.validation import validate_stops
 from app.mt5.constants import MT5Constants, mt5_constants
 from app.mt5.account import account_matches, account_profile
 from app.mt5.gateway import MT5Gateway
+from app.risk.authorization import authorization_state
 from app.risk.sizing import margin_within_free_margin, normalize_volume, required_margin, spec_from_symbol_info
+from app.risk.state import RiskStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +131,16 @@ class ExecutionService:
         if not margin_within_free_margin(margin, getattr(account, "margin_free", None)):
             return self._reject(db, intent, "insufficient free margin for the risk-sized volume", ["insufficient free margin"])
 
+        # The owner's single live-trade authorization is reserved in this same step, immediately
+        # before the send, and inside the same flow that authorizes it: a conditional UPDATE that
+        # exactly one caller in the whole deployment can win. It is spent *before* the order exists,
+        # so two scheduler cycles, a duplicate engine process or a process racing its own restart
+        # cannot both reach the broker. A reservation whose send then fails stays spent - the
+        # fail-closed direction - and re-arming costs an explicit manual authorization.
+        if settings.live_orders_permitted:
+            blocked = self._reserve_authorization(db, intent)
+            if blocked is not None: return blocked
+
         # Reserved only now: a pre-send rejection must not consume the idempotency key, but no
         # order can be sent without the reservation, so a duplicate can never reach the broker.
         guard = self._reserve(db, key, intent, volume)
@@ -218,6 +233,27 @@ class ExecutionService:
             logger.critical("order_blocked_account_is_real symbol=%s trade_mode=%s live_orders_permitted=%s", signal.symbol, profile.trade_mode, settings.live_orders_permitted)
             return ExecutionResult(REJECTED, f"the connected broker account is {profile.trade_mode_label} (trade_mode={profile.trade_mode}) and live trading is not enabled", ["real account without the live gate"])
         return None
+
+    def _reserve_authorization(self, db: Session, intent: TradeIntent) -> ExecutionResult | None:
+        """Reserve the one authorized live trade; None means this caller now owns the send.
+
+        In LIVE mode every order this service may send is a live order, so the reservation is made
+        here whatever the terminal happens to be logged in to. The reservation is a rowcount-checked
+        conditional UPDATE on the persisted authorization: of two cycles, two processes or a process
+        and its restart, exactly one is told ``True`` and permitted to continue.
+        """
+        store = RiskStateStore(db)
+        try:
+            won = store.consume_one_trade_authorization(intent.trade_id, f"{intent.signal.symbol} {intent.signal.action}")
+        except Exception as error:  # an unreadable authorization is not an unspent one
+            logger.critical("one_trade_authorization_unreservable trade_id=%s error=%s order_sent=false", intent.trade_id, type(error).__name__)
+            return self._reject(db, intent, "the single live-trade authorization could not be reserved, so no order was sent", ["the single live-trade authorization could not be reserved"])
+        if won:
+            logger.warning("one_trade_authorization_consumed trade_id=%s symbol=%s side=%s", intent.trade_id, intent.signal.symbol, intent.signal.action)
+            return None
+        reason = authorization_state(self.settings, store).blocked_reason or "the single authorized live trade was already reserved"
+        logger.critical("one_trade_authorization_already_consumed trade_id=%s symbol=%s reason=%s order_sent=false", intent.trade_id, intent.signal.symbol, reason)
+        return self._reject(db, intent, reason, ["the single authorized live trade is already consumed"])
 
     def _reserve(self, db: Session, key: str, intent: TradeIntent, volume: float) -> ExecutionGuardRecord | None:
         guard = ExecutionGuardRecord(idempotency_key=key, signal_id=intent.signal_id or intent.trade_id, symbol=intent.signal.symbol, side=str(intent.signal.action), volume=volume, status="PENDING")
