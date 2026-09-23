@@ -20,3 +20,4 @@ build/
 runtime/*
 !runtime/engine_service.py
 !runtime/engine_task.xml
+!runtime/second_worker_check.py

@@ -121,6 +121,12 @@ process is the single leader, `live_orders_permitted`, the open-position count, 
 P/L, trades used / `MAX_DAILY_TRADES` and the kill-switch state. No credential appears in it or in
 any log line.
 
+Exactly one process may turn a candle into an order: the market loop holds a lease row in
+`scheduler_locks` for its whole lifetime, so a second engine is a standby that never scans. Verify
+it on a running host with `python runtime/second_worker_check.py` — it runs one scheduler cycle as a
+separate process against the live database with a gateway that cannot reach the broker, and reports
+`skipped: true` with the lease still owned by the running engine.
+
 ## Known deployment boundary
 
 Docker is supplied for PostgreSQL/Redis/API development. The live MT5 worker must run on the Windows host that owns the MT5 terminal; never assume a Linux container can execute MT5 orders.
