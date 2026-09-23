@@ -78,10 +78,12 @@ class Settings(BaseSettings):
     stale_guard_seconds: int = Field(default=900, ge=1)
     news_window_minutes: int = Field(default=30, ge=0, le=1440)
     news_events_file: str | None = None
-    # Calendar provider. `trading_economics` reads the official Trading Economics calendar API; the
-    # credential is read from the environment only and is never logged. A provider that cannot be
-    # reached, cannot be authorized, cannot be parsed or is older than NEWS_MAX_AGE_SECONDS is
-    # reported as unusable, and NEWS_FAIL_CLOSED then refuses every new entry.
+    # Calendar provider. `mt5_calendar` (the deployment default) reads the JSON bridge an MQL5
+    # program writes from the terminal's *own* economic calendar: no credential, no paid API. The
+    # bridge must keep beating: a heartbeat older than MT5_CALENDAR_MAX_AGE_SECONDS (5 minutes by
+    # default) fails the gate. `trading_economics` reads the official Trading Economics calendar
+    # API and is required by nothing here - its credential is read from the environment only, is
+    # never logged, and is only consulted when that provider is selected.
     news_provider: str = "static"
     trading_economics_api_key: SecretStr | None = None
     trading_economics_base_url: str = "https://api.tradingeconomics.com"
@@ -90,6 +92,15 @@ class Settings(BaseSettings):
     news_provider_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
     news_lookback_hours: int = Field(default=12, ge=0, le=720)
     news_horizon_hours: int = Field(default=168, ge=1, le=8760)
+    # The MQL5 calendar bridge. MT5_CALENDAR_BRIDGE_FILE defaults to the MT5 Common Files path
+    # (<APPDATA>\MetaQuotes\Terminal\Common\Files\xdigitex_calendar.json) when it is left empty. A
+    # heartbeat older than MT5_CALENDAR_MAX_AGE_SECONDS, a bridge_status other than OK, a malformed
+    # file or a bridge clock that disagrees with this machine's clock all fail the news gate.
+    mt5_calendar_bridge_file: str | None = None
+    mt5_calendar_max_age_seconds: int = Field(default=300, ge=30, le=604_800)
+    mt5_calendar_read_seconds: int = Field(default=30, ge=1, le=3600)
+    mt5_calendar_failure_retry_seconds: int = Field(default=15, ge=1, le=3600)
+    mt5_calendar_clock_tolerance_seconds: int = Field(default=300, ge=0, le=86_400)
     # Read only by runtime/engine_service.py, the unattended Windows runner: it decides whether the
     # runner asks the API to resume the market loop after a reboot. It never bypasses a gate - the
     # runner calls the same validated /api/bot/start an operator would.

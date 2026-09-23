@@ -9,7 +9,35 @@ This is a **fail-closed, demo-first** algorithmic trading system. It does not pr
 - Every order requires a stop loss, risk approval, valid symbol/tick/spread/margin checks, and an idempotency key.
 - Unavailable MT5, database, market data, or news policy fails closed: no new orders.
 - `NEWS_FAIL_CLOSED=true` (the default) blocks new trades while no news calendar is configured: with no calendar there is no protection window to enforce, so the bot fails closed instead of pretending. Point `NEWS_EVENTS_FILE` at a JSON calendar, or set `NEWS_FAIL_CLOSED=false` to accept trading without news protection.
-- `NEWS_PROVIDER=trading_economics` reads the official Trading Economics calendar **API** (`api.tradingeconomics.com`, never their website and never a scrape). Rows are normalised into the app's news-event representation (`event id`, title, country, currency, UTC timestamp, impact, actual, forecast, previous, `retrieved_at`, provider), cached in `news_events`/`news_provider_state` so the provider is not called once per symbol per cycle, and matched to pairs by currency — a EUR event blocks EURUSD and EURGBP, never GBPJPY. Only **high-impact** events inside `NEWS_WINDOW_MINUTES` around the release block, and only *new* entries: the provider can never close an open position. A missing or rejected credential, a transport error, a non-200 answer, an unparsable payload, an invalid timestamp and a calendar older than `NEWS_MAX_AGE_SECONDS` are all reported as unusable, and `NEWS_FAIL_CLOSED=true` then refuses every new entry. The credential is read from `TRADING_ECONOMICS_API_KEY` in the environment only and is never logged.
+- `NEWS_PROVIDER=mt5_calendar` (what this deployment runs) is the **free** provider: it reads the JSON bridge an MQL5 program writes from the terminal's **own** economic calendar, so there is no paid API and no credential at all. See *The MT5 calendar bridge* below.
+- `NEWS_PROVIDER=trading_economics` reads the official Trading Economics calendar **API** (`api.tradingeconomics.com`, never their website and never a scrape). Rows are normalised into the app's news-event representation (`event id`, title, country, currency, UTC timestamp, impact, actual, forecast, previous, `retrieved_at`, provider), cached in `news_events`/`news_provider_state` so the provider is not called once per symbol per cycle, and matched to pairs by currency — a EUR event blocks EURUSD and EURGBP, never GBPJPY. Only **high-impact** events inside `NEWS_WINDOW_MINUTES` around the release block, and only *new* entries: the provider can never close an open position. A missing or rejected credential, a transport error, a non-200 answer, an unparsable payload, an invalid timestamp and a calendar older than `NEWS_MAX_AGE_SECONDS` are all reported as unusable, and `NEWS_FAIL_CLOSED=true` then refuses every new entry. The credential is read from `TRADING_ECONOMICS_API_KEY` in the environment only and is never logged. It is **optional**: nothing in this deployment requires it, and `NEWS_PROVIDER=mt5_calendar` works with the variable absent.
+
+## The MT5 calendar bridge (free, native)
+
+`mql5/XdigitexCalendarBridge.mq5` is a read-only Expert Advisor that exports the terminal's native
+MetaTrader 5 economic calendar for the eight traded currencies (`USD EUR GBP JPY CHF AUD CAD NZD`) to
+one JSON file in the MT5 Common Files folder, replacing it atomically every 60 seconds:
+
+    <APPDATA>\MetaQuotes\Terminal\Common\Files\xdigitex_calendar.json
+
+- **Timestamp normalisation.** MQL5 documents that every `Calendar*` timestamp is in *trade-server*
+  time, not UTC. The bridge exports each row's raw server time, the offset it measures itself in the
+  terminal (`TimeTradeServer() - TimeGMT()`, to the minute) and the UTC instant derived from them; the
+  Python side recomputes `server - offset` and refuses any row where the two disagree. No fixed +2/+3
+  is assumed anywhere, so a broker DST change is followed automatically.
+- **Importance** comes from MQL5's own `ENUM_CALENDAR_EVENT_IMPORTANCE` (`CALENDAR_IMPORTANCE_HIGH`,
+  `_MODERATE`, `_LOW`, `_NONE`) — the raw enum name and code travel with each row, and an unmappable
+  level fails the whole calendar rather than being guessed at.
+- **Heartbeat.** Every file carries `generated_at`, `terminal_server_time`, `server_utc_offset_seconds`,
+  `bridge_status` and `event_count`. A heartbeat older than `MT5_CALENDAR_MAX_AGE_SECONDS` (5 minutes),
+  a `bridge_status` other than `OK`, a missing/unreadable/malformed file, an event count that does not
+  match the exported rows, or a bridge clock that disagrees with this machine's clock all mean
+  `news_gate = FAIL` and no new trade. A restored calendar cache is never treated as healthy either.
+- **Deploying it.** Copy the source into the terminal's `MQL5\Experts` folder, compile it with
+  `metaeditor64.exe /compile:"<path>" /log:"<log>"` (this build reports *inverted* exit codes — a
+  successful compile returns 1 — so read the log's `Result: 0 errors` line and check the `.ex5`), and
+  make the terminal start it on launch: attach it to a chart in the terminal's last profile, or list
+  it in the terminal's startup configuration. The bridge needs no chart of its own and never trades.
 
 ## Hard server-side risk limits
 

@@ -21,9 +21,15 @@ traded right now?" — and get an honest answer about *availability* as well as 
   unrecognised importance, a calendar older than the allowed age — is reported as *not usable*, so
   the gate fails closed and no new position is opened. The provider never closes an existing
   position: it only answers whether a *new* entry is allowed.
+- ``Mt5CalendarProvider`` (``app/news/mt5_calendar.py``, selected with ``NEWS_PROVIDER=mt5_calendar``)
+  is the free provider this deployment runs: it reads the JSON bridge an MQL5 program writes from the
+  terminal's *own* economic calendar, so no credential and no paid API is involved. Its heartbeat,
+  its measured server-vs-UTC offset and its event rows are validated on every read; anything
+  unusable fails the gate exactly like the Trading Economics failures above.
 
-The provider's credential is read from the environment only. It is never logged, and it is only
-ever sent to the configured Trading Economics host.
+The Trading Economics credential is read from the environment only, is never logged, and is only
+ever sent to the configured Trading Economics host. It is required by the Trading Economics provider
+alone: ``NEWS_PROVIDER=mt5_calendar`` works with ``TRADING_ECONOMICS_API_KEY`` absent.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -43,6 +49,7 @@ IMPACT_LEVELS = (LOW_IMPACT, MEDIUM_IMPACT, HIGH_IMPACT)
 
 TRADING_ECONOMICS = "trading_economics"
 TRADING_ECONOMICS_BASE_URL = "https://api.tradingeconomics.com"
+MT5_CALENDAR = "mt5_calendar"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 
 # The gate distinguishes a fresh calendar from a stale one and from a provider that cannot be
@@ -371,10 +378,19 @@ class SqlNewsCache(NewsCache):
     able to see *when* the calendar it is holding was fetched — that age is what separates "fresh"
     from "stale". Failures here are logged and swallowed: an unwritable cache never fabricates a
     calendar, it only means the next process has to fetch one before it may trade.
+
+    One row set per provider, so each provider reads and writes only its own calendar.
     """
 
-    def __init__(self, session_factory):
+    def __init__(self, session_factory, provider: str = TRADING_ECONOMICS):
         self.session_factory = session_factory
+        self.provider = str(provider or TRADING_ECONOMICS)
+
+    def for_provider(self, provider: str) -> "SqlNewsCache":
+        """The same cache bound to another provider; the selected provider owns its own rows."""
+        if str(provider or "") == self.provider:
+            return self
+        return SqlNewsCache(self.session_factory, provider)
 
     def load(self) -> CachedCalendar | None:
         from sqlalchemy import select
@@ -382,8 +398,8 @@ class SqlNewsCache(NewsCache):
 
         try:
             with self._session() as db:
-                state = db.scalar(select(NewsProviderStateRecord).where(NewsProviderStateRecord.provider == TRADING_ECONOMICS))
-                rows = list(db.scalars(select(NewsEventRecord).where(NewsEventRecord.provider == TRADING_ECONOMICS).order_by(NewsEventRecord.event_time)))
+                state = db.scalar(select(NewsProviderStateRecord).where(NewsProviderStateRecord.provider == self.provider))
+                rows = list(db.scalars(select(NewsEventRecord).where(NewsEventRecord.provider == self.provider).order_by(NewsEventRecord.event_time)))
         except Exception as error:
             logger.error("news_cache_unreadable error=%s", type(error).__name__)
             return None
@@ -411,17 +427,17 @@ class SqlNewsCache(NewsCache):
         try:
             with self._session() as db:
                 if events:
-                    db.execute(delete(NewsEventRecord).where(NewsEventRecord.provider == TRADING_ECONOMICS))
+                    db.execute(delete(NewsEventRecord).where(NewsEventRecord.provider == self.provider))
                     for event in events:
                         db.add(NewsEventRecord(
-                            provider=event.provider or TRADING_ECONOMICS, event_id=event.event_id, title=event.title,
+                            provider=event.provider or self.provider, event_id=event.event_id, title=event.title,
                             country=event.country, currency=event.currency, impact=event.impact,
                             event_time=as_utc(event.when), actual=event.actual, forecast=event.forecast,
                             previous=event.previous, retrieved_at=as_utc(event.retrieved_at) or utcnow(),
                         ))
-                state = db.scalar(select(NewsProviderStateRecord).where(NewsProviderStateRecord.provider == TRADING_ECONOMICS))
+                state = db.scalar(select(NewsProviderStateRecord).where(NewsProviderStateRecord.provider == self.provider))
                 if state is None:
-                    state = NewsProviderStateRecord(provider=TRADING_ECONOMICS)
+                    state = NewsProviderStateRecord(provider=self.provider)
                     db.add(state)
                 state.healthy, state.detail, state.event_count = bool(healthy), str(detail or "")[:4000], len(events)
                 state.retrieved_at = as_utc(retrieved_at)
@@ -720,9 +736,35 @@ class TradingEconomicsCalendarProvider(NewsProvider):
         return NewsDecision(True, True, f"calendar {self.state(moment)} ({age:.0f}s old), no high impact news for {currencies} inside the +/-{self.window_minutes} minute window")
 
 
+def _cache_for(cache: NewsCache | None, provider: str) -> NewsCache | None:
+    """The same cache, bound to the provider that is about to use it, when it can be rebound."""
+    bind = getattr(cache, "for_provider", None)
+    return bind(provider) if callable(bind) else cache
+
+
 def build_news_provider(settings, cache: NewsCache | None = None) -> NewsProvider:
-    """Configured provider, or an honest 'unavailable' one when nothing is set up."""
+    """Configured provider, or an honest 'unavailable' one when nothing is set up.
+
+    ``mt5_calendar`` is the free provider: it reads the local JSON bridge the MQL5 program writes
+    from the terminal's own economic calendar and needs **no credential and no paid API**. The
+    Trading Economics provider is kept and still selectable, but it is no longer required by this
+    deployment: ``TRADING_ECONOMICS_API_KEY`` is only ever read when that provider is selected.
+    """
     provider = str(getattr(settings, "news_provider", "") or "static").strip().lower()
+    if provider == MT5_CALENDAR:
+        from app.news.mt5_calendar import Mt5CalendarProvider, default_bridge_path
+
+        configured = getattr(settings, "mt5_calendar_bridge_file", None)
+        return Mt5CalendarProvider(
+            configured or default_bridge_path(),
+            fail_closed=settings.news_fail_closed,
+            window_minutes=settings.news_window_minutes,
+            max_age_seconds=int(getattr(settings, "mt5_calendar_max_age_seconds", 300)),
+            read_seconds=int(getattr(settings, "mt5_calendar_read_seconds", 30)),
+            failure_retry_seconds=int(getattr(settings, "mt5_calendar_failure_retry_seconds", 15)),
+            clock_tolerance_seconds=int(getattr(settings, "mt5_calendar_clock_tolerance_seconds", 300)),
+            cache=_cache_for(cache, MT5_CALENDAR),
+        )
     if provider == TRADING_ECONOMICS:
         client = TradingEconomicsCalendarClient(
             getattr(settings, "trading_economics_api_key", None),
@@ -737,7 +779,7 @@ def build_news_provider(settings, cache: NewsCache | None = None) -> NewsProvide
             max_age_seconds=int(getattr(settings, "news_max_age_seconds", 900)),
             lookback_hours=int(getattr(settings, "news_lookback_hours", 12)),
             horizon_hours=int(getattr(settings, "news_horizon_hours", 168)),
-            cache=cache,
+            cache=_cache_for(cache, TRADING_ECONOMICS),
         )
     if settings.news_events_file:
         return StaticNewsProvider.from_file(settings.news_events_file, fail_closed=settings.news_fail_closed, window_minutes=settings.news_window_minutes)
