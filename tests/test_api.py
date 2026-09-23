@@ -74,7 +74,10 @@ def seed_closed_trade(db, trade_id: str, profit: float, close_time: datetime) ->
     return row
 
 
-def test_health_is_unauthenticated_and_keeps_the_mode_gates(client):
+def test_health_is_unauthenticated_and_keeps_the_mode_gates(client, monkeypatch):
+    # /api/health reports the process-wide configuration, so its premise is pinned here: the suite
+    # must not depend on the gates the operator's own .env happens to hold.
+    monkeypatch.setattr(main, "settings", api_settings(trading_mode="demo", live_trading_enabled=False))
     response = client.get("/api/health")
 
     assert response.status_code == 200
