@@ -38,6 +38,10 @@ never targets**: the bot risks less whenever the technical setup allows it.
   limit persists *why* the session closed to new entries.
 - Every order carries a broker-side stop loss (from the strategy's own ATR level, never an
   arbitrary dollar distance) and a take profit of at least 1:2.
+- Immediately after a fill the position is read back from MT5 and compared with the approved
+  levels. A position that was filled without its stop loss or take profit (or with a different one)
+  is repaired once with a SLTP modification and verified again; a position that is still
+  unprotected is **closed**, because an unprotected bot position is never left standing.
 - The account's own `trade_mode` is read from MT5 (0=DEMO, 1=CONTEST, 2=REAL) and reported. A REAL
   account is its own state: `TRADING_MODE=demo` never downgrades it, and no order is sent on a real
   account unless both live gates are set.

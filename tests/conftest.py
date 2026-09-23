@@ -134,6 +134,7 @@ class FakeGateway:
     order_list: tuple = ()
     closed: list = field(default_factory=list)
     cancelled: list = field(default_factory=list)
+    modified: list = field(default_factory=list)
     rates_calls: list = field(default_factory=list)
     history_fails: bool = False
 
@@ -153,7 +154,8 @@ class FakeGateway:
     def orders(self): return tuple(self.order_list)
     def history(self, start, end): return None if self.history_fails else tuple(self.deals)
     def discover_symbol(self, canonical): return canonical if canonical in self.symbols else None
-    def modify_position(self, ticket, symbol, stop_loss, take_profit): return None
+    def modify_position(self, ticket, symbol, stop_loss, take_profit):
+        self.modified.append((ticket, symbol, stop_loss, take_profit))
     def close_position(self, position):
         self.closed.append(position)
         if self.error: raise self.error

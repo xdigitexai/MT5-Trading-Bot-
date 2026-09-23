@@ -1,11 +1,29 @@
 """Execution must validate, fence duplicates and fail closed on any gateway problem."""
+from dataclasses import replace
+
 from sqlalchemy import select
 
 from app.core.config import Settings
 from app.core.schemas import SignalAction
 from app.database.base import AuditRecord, ExecutionGuardRecord, SignalRecord, TradeRecord
 from app.execution.service import ExecutionService
-from conftest import FakeAccount, FakeGateway, FakeOrderResult, FakeSymbolInfo, make_intent, make_signal
+from conftest import (
+    FakeAccount,
+    FakeGateway,
+    FakeOrderResult,
+    FakePosition,
+    FakeSymbolInfo,
+    make_intent,
+    make_signal,
+)
+
+
+class RepairingGateway(FakeGateway):
+    """A gateway whose SLTP modification is honoured, so a repair can be observed end to end."""
+
+    def modify_position(self, ticket, symbol, stop_loss, take_profit):
+        self.modified.append((ticket, symbol, stop_loss, take_profit))
+        self.position_list = tuple(replace(position, sl=stop_loss, tp=take_profit) for position in self.position_list)
 
 
 def service(settings, gateway) -> ExecutionService:
@@ -102,6 +120,41 @@ def test_derived_idempotency_key_blocks_a_repeat_of_the_same_signal(settings, ga
     assert execution.submit(db, make_intent(signal=signal, trade_id="trade-1", key="")).status == "EXECUTED"
     repeat = execution.submit(db, make_intent(signal=signal, trade_id="trade-2", key=""))
     assert repeat.status == "DUPLICATE" and len(gateway.requests) == 1
+
+
+def test_filled_position_is_read_back_and_verified(settings, db):
+    gateway = FakeGateway(position_list=(FakePosition(),))
+    result = service(settings, gateway).submit(db, make_intent())
+    assert result.status == "EXECUTED"
+    assert result.protection["verified"] and not result.protection["corrected"] and not result.protection["closed"]
+    assert result.protection["position"]["stop_loss"] == 1.09 and result.protection["position"]["take_profit"] == 1.12
+    assert gateway.modified == [] and gateway.closed == []
+    assert [event.event_type for event in rows(db, AuditRecord)] == ["TRADE_SUBMITTED"]
+
+
+def test_position_filled_without_protection_is_repaired(settings, db):
+    gateway = RepairingGateway(position_list=(FakePosition(sl=0.0, tp=0.0),))
+    result = service(settings, gateway).submit(db, make_intent())
+    assert result.protection["verified"] and result.protection["corrected"] and not result.protection["closed"]
+    assert gateway.modified == [(55501, "EURUSD", 1.09, 1.12)]
+    assert gateway.closed == []
+    assert [event.event_type for event in rows(db, AuditRecord)] == ["TRADE_SUBMITTED", "TRADE_PROTECTION_CORRECTED"]
+
+
+def test_position_that_cannot_be_protected_is_closed(settings, db):
+    gateway = FakeGateway(position_list=(FakePosition(sl=0.0, tp=1.12),))
+    result = service(settings, gateway).submit(db, make_intent())
+    assert result.protection["closed"] and not result.protection["verified"]
+    assert gateway.modified == [(55501, "EURUSD", 1.09, 1.12)]
+    assert [position.ticket for position in gateway.closed] == [55501]
+    assert [event.event_type for event in rows(db, AuditRecord)] == ["TRADE_SUBMITTED", "TRADE_PROTECTION_FAILED"]
+
+
+def test_a_widened_stop_is_not_accepted_as_protection(settings, db):
+    """The approved stop is the only acceptable one: a wider broker stop would break the budget."""
+    gateway = RepairingGateway(position_list=(FakePosition(sl=1.08),))
+    result = service(settings, gateway).submit(db, make_intent())
+    assert result.protection["corrected"] and gateway.modified == [(55501, "EURUSD", 1.09, 1.12)]
 
 
 def test_gateway_returning_nothing_fails_closed_and_is_recorded(settings, db):
