@@ -24,6 +24,7 @@ import logging
 from app.core.clock import isoformat, utcnow
 from app.core.config import Settings
 from app.database.base import AuditRecord
+from app.mt5.account import AccountProfile, account_profile
 from app.mt5.constants import mt5_constants
 from app.mt5.gateway import MT5Gateway
 from app.risk.state import RiskStateStore
@@ -92,6 +93,16 @@ class BotService:
         if not login.connected:
             self.gateway.shutdown()
             return self._fail(f"MT5 login failed: {login.detail}")
+        profile = self.account_profile()
+        if profile is None:
+            self.gateway.shutdown()
+            return self._fail("the broker account could not be read after login; refusing to start (fail closed)")
+        if profile.is_real:
+            # A real account is reported as its own state, never downgraded by TRADING_MODE.
+            logger.critical(
+                "bot_start_account_is_real login=%s server=%s company=%s trade_mode=%s balance=%.2f live_orders_permitted=%s",
+                profile.login, profile.server, profile.company, profile.trade_mode, profile.balance, self.settings.live_orders_permitted,
+            )
         if self.scheduler is None:
             self.gateway.shutdown()
             return self._fail("no market loop is configured for this bot")
@@ -159,10 +170,26 @@ class BotService:
                 if not health.connected:
                     self.state.state, self.state.detail = BotState.DEGRADED, f"degraded: MT5 is unhealthy ({health.detail})"
                 else:
-                    blocked = self._market_block_reason()
+                    blocked = self._real_account_reason() or self._market_block_reason()
                     self.state.state = BotState.DEGRADED if blocked else BotState.RUNNING
                     self.state.detail = f"degraded: {blocked}" if blocked else "running: MT5 healthy and every configured symbol scanned"
         return self.state.state
+
+    def account_profile(self) -> AccountProfile | None:
+        """The broker account as MT5 reports it; None when it cannot be read."""
+        return account_profile(self.gateway.account_info())
+
+    def _real_account_reason(self) -> str | None:
+        """A REAL broker account is its own state: TRADING_MODE never downgrades it to demo."""
+        profile = self.account_profile()
+        if profile is None:
+            return None
+        if profile.is_real and not self.settings.live_orders_permitted:
+            return (f"the connected broker account is {profile.trade_mode_label} (trade_mode={profile.trade_mode}, "
+                    f"server {profile.server}) while live trading is not enabled: no order may be sent")
+        if not profile.classified:
+            return f"the broker account trade mode is unrecognised (trade_mode={profile.trade_mode}): the account is not verified as demo"
+        return None
 
     def _market_block_reason(self) -> str | None:
         """First fail-closed reason when the last cycle could not scan a single symbol."""
@@ -176,6 +203,8 @@ class BotService:
     def status(self) -> dict:
         self.refresh_state()
         health = self.gateway.health()
+        profile = self.account_profile()
+        real_account_block = self._real_account_reason()
         return {
             "state": self.state.state.value,
             "detail": self.state.detail,
@@ -186,6 +215,17 @@ class BotService:
             "scheduler": self.scheduler.status() if self.scheduler is not None else None,
             "mode": self.settings.trading_mode.value,
             "live_orders_permitted": self.settings.live_orders_permitted,
+            # The account's own trade mode, reported next to (never replaced by) the bot's mode.
+            "account": profile.as_dict() if profile is not None else None,
+            "account_trade_mode": profile.trade_mode_label if profile is not None else "UNKNOWN",
+            "account_state": "BLOCKED:" + real_account_block if real_account_block else "AUTHORIZED",
+            "hard_limits": {
+                "max_bot_capital_usd": self.settings.max_bot_capital_usd,
+                "max_loss_per_trade_usd": self.settings.max_loss_per_trade_usd,
+                "max_session_loss_usd": self.settings.max_session_loss_usd,
+                "max_daily_trades": self.settings.max_daily_trades,
+                "max_open_positions": self.settings.max_open_positions,
+            },
         }
 
     # ------------------------------------------------------------------ internals

@@ -23,8 +23,17 @@ def trading_settings(**overrides) -> Settings:
 
     An unavailable news source is only tolerated when the policy does not require protection, so
     the default here states that policy explicitly; tests that need a stricter policy override it.
+
+    The fixture models a demo account that can fund a 10 000 USD balance, so the dollar risk
+    limits are scaled to it. The shipped hard limits (3 USD capital, 0.10 USD per trade, 0.30 USD
+    per session, 3 trades, 1 position) are exercised against real broker properties in
+    tests/test_hard_limits.py.
     """
-    values = {"symbols": ["EURUSD"], "news_fail_closed": False}
+    values = {
+        "symbols": ["EURUSD"], "news_fail_closed": False,
+        "max_bot_capital_usd": 1_000.0, "max_loss_per_trade_usd": 50.0,
+        "max_session_loss_usd": 200.0, "max_daily_trades": 3,
+    }
     values.update(overrides)
     return Settings(_env_file=None, **values)
 
@@ -106,14 +115,16 @@ def test_the_same_closed_candle_never_orders_twice_across_a_restart(settings, se
     assert len(rows(db, TradeRecord)) == 1 and len(rows(db, SignalRecord)) == 1
     assert len(rows(db, ExecutionGuardRecord)) == 1
 
-    # Even with the persisted signal removed, the idempotency fence still refuses the order.
+    # Even with the persisted signal removed, the order is still refused: the gate sees the trade
+    # and the reserved idempotency key the first cycle left behind.
     db.delete(db.scalar(select(SignalRecord)))
     db.commit()
     third_gateway = market_gateway(now)
     third = scheduler_for(trading_settings(), third_gateway, session_factory).run_once(now=now)
     assert third_gateway.requests == [] and third["executions"] == 0
     assert len(rows(db, TradeRecord)) == 1
-    assert db.scalar(select(SignalRecord)).status == SignalStatus.DUPLICATE.value
+    row = db.scalar(select(SignalRecord))
+    assert row.status == SignalStatus.RISK_REJECTED.value and "no_duplicate" in (row.reason or "")
 
 
 def test_overlapping_runs_are_impossible_within_one_process(settings, session_factory):

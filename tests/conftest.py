@@ -41,6 +41,18 @@ class FakeAccount:
     margin_free: float = 9_000.0
     margin_level: float = 1_000.0
     leverage: float = 100.0
+    # 0 = DEMO, 1 = CONTEST, 2 = REAL, as MT5 reports it.
+    trade_mode: int = 0
+    login: int = 134693538
+    server: str = "FakeServer-Demo"
+    company: str = "Fake Broker"
+    currency: str = "USD"
+
+
+@dataclass
+class FakeTerminalInfo:
+    trade_allowed: bool = True
+    connected: bool = True
 
 
 @dataclass
@@ -108,6 +120,7 @@ class FakeGateway:
     """Gateway stand-in: MT5 is never imported and every call is observable."""
     symbols: dict = field(default_factory=lambda: {"EURUSD": FakeSymbolInfo(), "GBPUSD": FakeSymbolInfo()})
     account: FakeAccount | None = field(default_factory=FakeAccount)
+    terminal: object = field(default_factory=FakeTerminalInfo)
     result: object = field(default_factory=FakeOrderResult)
     error: Exception | None = None
     connected: bool = True
@@ -126,6 +139,7 @@ class FakeGateway:
     def health(self): return MT5Health(self.connected, "fake gateway")
     def symbol_info(self, symbol): return self.symbols.get(symbol)
     def account_info(self): return self.account
+    def terminal_info(self): return self.terminal
     def tick(self, symbol): return self.tick_value
     def rates(self, symbol, timeframe, count):
         self.rates_calls.append((symbol, timeframe, count))

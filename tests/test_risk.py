@@ -1,63 +1,140 @@
+"""The pre-trade gate: every check is named, any failure means NO TRADE, limits come from the store."""
 from datetime import date, datetime, timezone
+
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+
 from app.core.config import Settings
 from app.core.schemas import Signal, SignalAction
 from app.database.base import Base
-from app.risk.engine import RiskEngine, SymbolSpec
+from app.mt5.account import AccountProfile
+from app.risk.engine import CHECK_ORDER, EntryFacts, RiskEngine
+from app.risk.sizing import SymbolSpec
 from app.risk.state import RiskStateStore
 
-def signal(): return Signal(action=SignalAction.BUY, confidence=.8, score=80, symbol="EURUSD", entry=1.1, stop_loss=1.09, take_profit=1.12, strategy="test", timeframe="M15", timestamp=datetime.now(timezone.utc))
-def spec(): return SymbolSpec(.01, 100, .01, 1, .00001, .00001, 0)
-def test_lot_size_uses_risk_and_rounds_down(): assert RiskEngine(Settings()).lot_size(10_000, 1.1, 1.09, spec()) == .05
-def test_daily_loss_blocks_trade():
-    result=RiskEngine(Settings()).approve(signal(), equity=10_000, balance_peak=10_000, daily_pnl=-201, open_positions=0, symbol_positions=0, spread_points=1, spec=spec(), trading_enabled=True, news_clear=True)
-    assert not result.approved and "daily loss limit reached" in result.reasons
-def test_stop_loss_is_mandatory():
-    result=RiskEngine(Settings()).approve(signal().model_copy(update={"stop_loss":None}), equity=10_000,balance_peak=10_000,daily_pnl=0,open_positions=0,symbol_positions=0,spread_points=1,spec=spec(),trading_enabled=True,news_clear=True)
-    assert not result.approved
-def test_invalid_market_conditions_and_duplicate_reject():
-    result=RiskEngine(Settings()).approve(signal(), equity=10_000,balance_peak=10_000,daily_pnl=0,open_positions=0,symbol_positions=0,spread_points=1,spec=spec(),trading_enabled=True,news_clear=True,market_open=False,tick_valid=False,margin_sufficient=False,duplicate_exists=True)
-    assert not result.approved
-    assert {"market closed","invalid tick","insufficient margin","duplicate position or order exists"}.issubset(result.reasons)
+# A micro-contract major: one point (0.00001) is worth 0.10 USD per lot, so the 0.10 USD per-trade
+# budget is expressible with the broker minimum volume.
+MICRO = SymbolSpec(volume_min=0.01, volume_max=100.0, volume_step=0.01, tick_value=0.1, tick_size=0.00001, point=0.00001, contract_size=10_000.0)
+# A standard contract: one point is worth 1.00 USD per lot, so the broker minimum risks 0.30 USD.
+STANDARD = SymbolSpec(.01, 100, .01, 1, .00001, .00001, 0)
 
 
-def engine(): return RiskEngine(Settings(_env_file=None))
-def approve(**overrides):
-    sig = overrides.pop("signal", signal())
-    kwargs = dict(equity=10_000.0, balance_peak=10_000.0, daily_pnl=0.0, open_positions=0, symbol_positions=0, spread_points=1.0, spec=spec(), trading_enabled=True, news_clear=True)
-    kwargs.update(overrides)
-    return engine().approve(sig, **kwargs)
+def signal(**overrides) -> Signal:
+    values = dict(action=SignalAction.BUY, confidence=.8, score=80, symbol="EURUSDm", entry=1.10000, stop_loss=1.09970, take_profit=1.10060, strategy="test", timeframe="M15")
+    values.update(overrides)
+    return Signal(timestamp=datetime.now(timezone.utc), **values)
 
 
-def test_approved_trade_passes_with_a_derived_volume():
-    result = approve()
-    assert result.approved and result.reasons == [] and result.volume == 0.05
+def account(trade_mode=0) -> AccountProfile:
+    return AccountProfile(login=1, server="Test", company="Test", currency="USD", balance=11.56, equity=11.56, free_margin=11.56, leverage=400.0, trade_mode=trade_mode)
 
 
-def test_position_and_spread_limits_block():
-    assert "maximum simultaneous positions reached" in approve(open_positions=5).reasons
-    assert "maximum positions per symbol reached" in approve(symbol_positions=1).reasons
-    assert "spread protection triggered" in approve(spread_points=26).reasons
-    assert "maximum drawdown emergency stop" in approve(equity=8_000.0, balance_peak=10_000.0).reasons
-    assert "news filter blocks trading" in approve(news_clear=False).reasons
+def facts(**overrides) -> EntryFacts:
+    base = dict(
+        spec=MICRO, connected=True, account=account(), algo_trading_enabled=True, data_age_seconds=5.0,
+        momentum_action="HOLD", spread_points=1.0, open_positions=0, symbol_positions=0, exposure=0.0,
+        margin_level=None, duplicate_exists=False, emergency_locked=False, trading_enabled=True,
+        free_margin=11.56, equity=11.56, leverage=400.0,
+    )
+    base.update(overrides)
+    return EntryFacts(**base)
 
 
-def test_total_exposure_margin_level_and_risk_guard_limits():
-    assert "total exposure limit reached" in approve(exposure=30_000.0).reasons
-    assert "margin level below minimum" in approve(margin_level=100.0).reasons
-    assert approve(margin_level=1_000.0, exposure=19_000.0).approved
-    guarded = RiskEngine(Settings(_env_file=None, risk_per_trade_pct=2, max_risk_per_trade_pct=1))
-    result = guarded.approve(signal(), equity=10_000, balance_peak=10_000, daily_pnl=0, open_positions=0, symbol_positions=0, spread_points=1, spec=spec(), trading_enabled=True, news_clear=True)
-    assert not result.approved and "risk per trade exceeds configured guard" in result.reasons
+def engine(settings=None) -> RiskEngine:
+    return RiskEngine(settings or Settings(_env_file=None))
 
 
-def test_free_margin_below_required_margin_blocks():
-    sized = SymbolSpec(.01, 100, .01, 1, .00001, .00001, 0, 0, 100_000.0)  # 0.05 lots needs 55 of margin at 1:100
-    assert "insufficient margin for risk-sized volume" in approve(free_margin=10.0, leverage=100.0, spec=sized).reasons
-    assert approve(free_margin=1_000.0, leverage=100.0, spec=sized).approved
-    # A spec that cannot express margin at all is unverifiable, so it must not be approved.
-    assert "insufficient margin for risk-sized volume" in approve(free_margin=1_000.0, leverage=100.0).reasons
+def assess(sig=None, settings=None, **overrides):
+    return engine(settings).assess(sig or signal(), facts(**overrides))
+
+
+def failures(result) -> set[str]:
+    return set(result.failed_checks)
+
+
+def test_the_chain_runs_the_documented_order():
+    result = assess()
+    assert [check.name for check in result.checks] == list(CHECK_ORDER)
+    assert CHECK_ORDER[:11] == (
+        "mt5_connected", "account_authorized", "algo_trading_enabled", "fresh_market_data",
+        "trend_signal", "momentum_confirmed", "spread_within_limit", "valid_stop_loss",
+        "valid_take_profit", "risk_reward", "position_sizing",
+    )
+
+
+def test_an_approved_trade_is_sized_from_the_loss_budget_and_the_technical_stop():
+    result = assess()
+
+    assert result.approved and result.failures == []
+    # 0.10 USD / (30 points x 0.10 USD per point per lot) = 0.033 -> floored to the 0.01 step.
+    assert result.volume == pytest.approx(0.03)
+    assert result.risk_usd == pytest.approx(0.09)
+    assert result.risk_usd <= 0.10
+    assert result.stop_distance_points == pytest.approx(30.0)
+    assert result.margin_usd == pytest.approx(0.825, abs=1e-6)
+    assert result.risk_reward == pytest.approx(2.0)
+
+
+def test_the_broker_minimum_volume_may_not_exceed_the_per_trade_budget():
+    result = assess(spec=STANDARD)
+
+    assert not result.approved and "position_sizing" in failures(result)
+    assert "broker minimum volume 0.01 would risk 0.30 USD" in result.reason
+    assert result.volume is None
+
+
+def test_missing_stop_loss_is_never_traded():
+    result = assess(signal(stop_loss=None))
+    assert not result.approved and "valid_stop_loss" in failures(result)
+    assert "no stop loss" in result.reason
+
+
+def test_a_stop_on_the_wrong_side_is_rejected():
+    assert "valid_stop_loss" in failures(assess(signal(action=SignalAction.BUY, stop_loss=1.11000)))
+    assert "valid_stop_loss" in failures(assess(signal(action=SignalAction.SELL, stop_loss=1.09000)))
+
+
+def test_missing_take_profit_and_below_two_to_one_are_rejected():
+    assert "valid_take_profit" in failures(assess(signal(take_profit=None)))
+    assert "risk_reward" in failures(assess(signal(take_profit=1.10030)))
+    assert assess(signal(take_profit=1.10060)).approved  # exactly 1:2 is enough
+
+
+def test_spread_position_and_duplicate_limits_block():
+    assert "spread_within_limit" in failures(assess(spread_points=26))
+    assert "single_position" in failures(assess(open_positions=1))
+    assert "symbol_position_limit" in failures(assess(symbol_positions=1))
+    assert "no_duplicate" in failures(assess(duplicate_exists=True))
+    assert "single_position" in failures(assess(open_positions=None))
+
+
+def test_connection_account_and_terminal_state_block():
+    assert "mt5_connected" in failures(assess(connected=False))
+    assert "algo_trading_enabled" in failures(assess(algo_trading_enabled=False))
+    assert "algo_trading_enabled" in failures(assess(algo_trading_enabled=None))
+    assert "account_authorized" in failures(assess(account=None))
+    assert "account_authorized" in failures(assess(account=account(trade_mode=None)))
+
+
+def test_stale_data_weak_signal_and_contradicting_momentum_block():
+    assert "fresh_market_data" in failures(assess(data_age_seconds=None))
+    assert "fresh_market_data" in failures(assess(data_age_seconds=100_000))
+    assert "trend_signal" in failures(assess(signal(action=SignalAction.HOLD)))
+    assert "trend_signal" in failures(assess(signal(score=10)))
+    assert "momentum_confirmed" in failures(assess(momentum_action="SELL"))
+    assert "momentum_confirmed" in failures(assess(momentum_action=None))
+
+
+def test_exposure_and_margin_level_guards_are_retained():
+    assert "total_exposure" in failures(assess(exposure=30_000.0))
+    assert "margin_level" in failures(assess(margin_level=100.0))
+    assert assess(margin_level=1_000.0, exposure=19.0).approved
+
+
+def test_emergency_state_blocks():
+    assert "emergency_stop_clear" in failures(assess(emergency_locked=True))
+    assert "emergency_stop_clear" in failures(assess(trading_enabled=False))
 
 
 def test_daily_loss_breach_is_read_from_the_store_and_survives_a_restart(tmp_path):
@@ -67,15 +144,15 @@ def test_daily_loss_breach_is_read_from_the_store_and_survives_a_restart(tmp_pat
         store = RiskStateStore(db)
         store.observe_equity(10_000.0)
         store.add_realized_pnl(-250.0)
-        first = RiskEngine(settings).approve(signal(), equity=10_000, balance_peak=10_000, daily_pnl=0, open_positions=0, symbol_positions=0, spread_points=1, spec=spec(), trading_enabled=True, news_clear=True, state=store)
-        assert not first.approved and "daily loss limit reached" in first.reasons
+        first = engine(settings).assess(signal(), facts(equity=10_000.0, free_margin=10_000.0), state=store)
+        assert not first.approved and "loss_limits" in failures(first)
     engine_one.dispose()
 
     # Simulated restart: new engine objects, new session, zero in-memory counters, same database.
     engine_two, session_two = risk_database(tmp_path)
     with session_two() as db:
-        second = RiskEngine(settings).approve(signal(), equity=10_000, balance_peak=10_000, daily_pnl=0, open_positions=0, symbol_positions=0, spread_points=1, spec=spec(), trading_enabled=True, news_clear=True, state=RiskStateStore(db))
-        assert not second.approved and "daily loss limit reached" in second.reasons
+        second = engine(settings).assess(signal(), facts(equity=10_000.0, free_margin=10_000.0), state=RiskStateStore(db))
+        assert not second.approved and "loss_limits" in failures(second)
     engine_two.dispose()
 
 
@@ -85,18 +162,17 @@ def test_drawdown_peak_and_emergency_lock_survive_a_restart(tmp_path):
     with session_one() as db:
         store = RiskStateStore(db)
         store.observe_equity(12_000.0)
-        # balance_peak is passed as 9 000 to prove the peak comes from the persistent store.
-        first = RiskEngine(settings).approve(signal(), equity=9_000, balance_peak=9_000, daily_pnl=0, open_positions=0, symbol_positions=0, spread_points=1, spec=spec(), trading_enabled=True, news_clear=True, state=store)
-        assert not first.approved and "maximum drawdown emergency stop" in first.reasons
+        first = engine(settings).assess(signal(), facts(equity=9_000.0, free_margin=9_000.0), state=store)
+        assert not first.approved and "loss_limits" in failures(first)
         assert store.load().emergency_locked is True
     engine_one.dispose()
 
     engine_two, session_two = risk_database(tmp_path)
     with session_two() as db:
         store = RiskStateStore(db)
-        second = RiskEngine(settings).approve(signal(), equity=9_000, balance_peak=9_000, daily_pnl=0, open_positions=0, symbol_positions=0, spread_points=1, spec=spec(), trading_enabled=True, news_clear=True, state=store)
+        second = engine(settings).assess(signal(), facts(equity=9_000.0, free_margin=9_000.0), state=store)
         assert not second.approved
-        assert {"maximum drawdown emergency stop", "bot is stopped or emergency locked"}.issubset(second.reasons)
+        assert {"loss_limits", "emergency_stop_clear"}.issubset(failures(second))
         # The lock is not cleared by a new trading day either.
         assert store.load(date(2999, 1, 1)).emergency_locked is True
     engine_two.dispose()

@@ -64,6 +64,17 @@ class RiskStateStore:
         self.db.refresh(row)
         return row
 
+    def register_trade_opened(self, day: date | None = None) -> RiskStateRecord:
+        """Count one opened position; the counter is read back from the database, never memory."""
+        row = self.load(day)
+        row.trades_opened = int(row.trades_opened or 0) + 1
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    def trades_opened(self, day: date | None = None) -> int:
+        return int(self.load(day).trades_opened or 0)
+
     def set_emergency_locked(self, locked: bool, day: date | None = None) -> RiskStateRecord:
         row = self.load(day)
         row.emergency_locked = bool(locked)

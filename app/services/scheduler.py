@@ -45,13 +45,14 @@ from sqlalchemy.orm import Session
 from app.core.clock import as_utc, isoformat, utcnow
 from app.core.config import Settings
 from app.core.schemas import Signal, SignalAction, SignalStatus, TradeIntent
-from app.database.base import SignalRecord
+from app.database.base import ExecutionGuardRecord, SignalRecord, TradeRecord
 from app.database.runtime import SchedulerLockRecord
 from app.execution.service import ExecutionService
 from app.execution.validation import validate_stops
+from app.mt5.account import AccountProfile, account_profile
 from app.mt5.gateway import MT5Gateway
 from app.news.provider import NewsProvider, build_news_provider
-from app.risk.engine import RiskEngine
+from app.risk.engine import EntryFacts, RiskEngine
 from app.risk.sizing import SymbolSpec, spec_from_symbol_info
 from app.risk.state import RiskStateStore
 from app.services.market import TickSnapshot, candle_close_time, completed_candles, tick_snapshot
@@ -114,6 +115,10 @@ class SymbolContext:
     open_positions: int
     symbol_positions: int
     store: RiskStateStore
+    profile: AccountProfile | None
+    algo_trading_enabled: bool | None
+    data_age_seconds: float | None
+    momentum_action: str | None
     frames: dict = field(default_factory=dict)
     candle_closes: dict = field(default_factory=dict)
 
@@ -342,13 +347,24 @@ class MarketScheduler:
         if votes is None:
             return self._block(result, cycle, vote_reason)
         candidates = self._candidates(votes, symbol)
+        profile = account_profile(account)
+        terminal = self.gateway.terminal_info() if hasattr(self.gateway, "terminal_info") else None
         context = SymbolContext(
             symbol=symbol, now=now, account=account, spec=spec, tick=tick, equity=float(equity),
             free_margin=getattr(account, "margin_free", None), leverage=float(getattr(account, "leverage", 0) or 0),
             margin_level=self._margin_level(account), exposure=exposure, open_positions=len(managed),
             symbol_positions=sum(1 for position in managed if str(getattr(position, "symbol", "")).upper() == symbol.upper()),
-            store=store, frames=frames, candle_closes=closes,
+            store=store, profile=profile,
+            algo_trading_enabled=None if terminal is None else bool(getattr(terminal, "trade_allowed", False)),
+            data_age_seconds=(now - tick.time).total_seconds() if tick.time is not None else None,
+            momentum_action=self._momentum_action(symbol, frames),
+            frames=frames, candle_closes=closes,
         )
+        if profile is not None and profile.is_real:
+            logger.critical(
+                "account_is_real login=%s server=%s trade_mode=%s live_orders_permitted=%s trading_mode=%s",
+                profile.login, profile.server, profile.trade_mode, self.settings.live_orders_permitted, self.settings.trading_mode.value,
+            )
         result["candidates"] = len(candidates)
         for signal in candidates:
             candle_time = closes.get(signal.timeframe)
@@ -412,6 +428,26 @@ class MarketScheduler:
             return [combined]
         return [vote for vote in votes if vote.action is not SignalAction.HOLD]
 
+    def _momentum_action(self, symbol: str, frames: dict) -> str | None:
+        """Momentum as confirmation only: it never creates a candidate, and an unreadable value blocks."""
+        evaluate = self.strategies.get("momentum") or STRATEGIES.get("momentum")
+        frame = frames.get(strategy_timeframe(self.settings, "momentum"))
+        if evaluate is None or frame is None:
+            logger.warning("momentum_confirmation_unavailable symbol=%s", symbol)
+            return None
+        try:
+            signal = evaluate(symbol, frames["H4"], frames["H1"], frame, rr=self.settings.min_risk_reward_ratio)
+        except Exception as error:
+            logger.error("momentum_confirmation_failed symbol=%s error=%s", symbol, type(error).__name__)
+            return None
+        return str(signal.action)
+
+    def _duplicate_order_exists(self, db: Session, signal_id: str) -> bool:
+        """True when this signal already produced an order or reserved an idempotency key."""
+        trade = db.scalar(select(TradeRecord).where(TradeRecord.trade_id == signal_id))
+        guard = db.scalar(select(ExecutionGuardRecord).where(ExecutionGuardRecord.idempotency_key == signal_id))
+        return trade is not None or guard is not None
+
     # ------------------------------------------------------------------ candidate
 
     def _submit_candidate(self, db: Session, signal: Signal, candle_time: datetime, context: SymbolContext) -> dict:
@@ -429,26 +465,34 @@ class MarketScheduler:
         final = signal.model_copy(update={"entry": entry, "stop_loss": stop_loss, "take_profit": take_profit})
         row.entry_price, row.stop_loss, row.take_profit = entry, stop_loss, take_profit
         db.commit()
-        decision = self.risk.approve(
+        decision = self.risk.assess(
             final,
-            equity=context.equity,
-            balance_peak=context.equity,
-            daily_pnl=0.0,
-            open_positions=context.open_positions,
-            symbol_positions=context.symbol_positions,
-            spread_points=context.tick.spread_points(context.spec.point),
-            spec=context.spec,
-            trading_enabled=True,
-            news_clear=True,
-            exposure=context.exposure,
-            margin_level=context.margin_level,
-            free_margin=context.free_margin,
-            leverage=context.leverage,
+            EntryFacts(
+                spec=context.spec,
+                connected=True,
+                account=context.profile,
+                algo_trading_enabled=context.algo_trading_enabled,
+                data_age_seconds=context.data_age_seconds,
+                momentum_action=context.momentum_action,
+                spread_points=context.tick.spread_points(context.spec.point),
+                open_positions=context.open_positions,
+                symbol_positions=context.symbol_positions,
+                exposure=context.exposure,
+                margin_level=context.margin_level,
+                duplicate_exists=self._duplicate_order_exists(db, signal_id),
+                emergency_locked=False,
+                trading_enabled=True,
+                free_margin=context.free_margin,
+                equity=context.equity,
+                leverage=context.leverage,
+            ),
             state=context.store,
         )
+        result = decision.as_dict()
         if not decision.approved or not decision.volume:
-            reasons = decision.reasons or ["the risk engine did not return a usable volume"]
-            return self._reject_signal(db, row, reasons, "risk_rejected", persisted)
+            reasons = [f"{check.name}: {check.reason}" for check in decision.failures] or ["the risk engine did not return a usable volume"]
+            rejected = self._reject_signal(db, row, reasons, "risk_rejected", persisted)
+            return {**rejected, "risk": result}
         intent = TradeIntent(
             trade_id=signal_id, signal=final, volume=float(decision.volume), requested_price=entry,
             idempotency_key=signal_id, signal_id=signal_id,
@@ -463,11 +507,14 @@ class MarketScheduler:
             db.commit()
         if outcome.accepted:
             self.state.last_execution_at = context.now
+            # The counter lives in the database, so the next process cannot start with a fresh
+            # allowance of trades after a restart.
+            context.store.register_trade_opened()
         logger.info(
             "signal_outcome signal_id=%s symbol=%s strategy=%s status=%s volume=%s ticket=%s retcode=%s reason=%s",
             signal_id, signal.symbol, signal.strategy, outcome.status, decision.volume, outcome.order_ticket, outcome.retcode, outcome.reason,
         )
-        return {"signal_id": signal_id, "status": outcome.status, "reason": outcome.reason, "order_ticket": outcome.order_ticket, "persisted": persisted, "volume": float(decision.volume)}
+        return {"signal_id": signal_id, "status": outcome.status, "reason": outcome.reason, "order_ticket": outcome.order_ticket, "persisted": persisted, "volume": float(decision.volume), "risk": result}
 
     def _persist_signal(self, db: Session, signal: Signal, candle_time: datetime, signal_id: str, existing: SignalRecord | None) -> tuple[SignalRecord, bool]:
         if existing is not None:

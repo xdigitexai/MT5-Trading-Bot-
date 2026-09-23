@@ -35,6 +35,7 @@ class MT5Gateway:
         info = mt5.terminal_info()
         return MT5Health(info is not None, "healthy" if info else str(mt5.last_error()))
     def account_info(self) -> Any: return mt5.account_info() if self.health().connected else None
+    def terminal_info(self) -> Any: return mt5.terminal_info() if self.health().connected else None
     def discover_symbol(self, canonical: str) -> str | None:
         if not self.health().connected: return None
         candidates = mt5.symbols_get(group=f"*{canonical}*") or []

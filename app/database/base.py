@@ -78,6 +78,9 @@ class RiskStateRecord(Base):
     starting_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
     peak_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
     emergency_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Trades opened by this bot today/session. Persisted for the same reason as realized_pnl: a
+    # restart must not hand the loop a fresh allowance of orders.
+    trades_opened: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

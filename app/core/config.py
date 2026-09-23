@@ -31,8 +31,16 @@ class Settings(BaseSettings):
     risk_per_trade_pct: float = Field(default=0.5, gt=0, le=2)
     max_daily_loss_pct: float = Field(default=2, gt=0, le=10)
     max_drawdown_pct: float = Field(default=10, gt=0, le=50)
-    max_open_positions: int = Field(default=5, ge=1, le=50)
+    # Hard server-side limits. The dollar limits are absolute ceilings on a small real-money
+    # account, not percentages of equity: MAX_BOT_CAPITAL_USD is the allocation ceiling for this
+    # bot (never the account's equity), and the loss limits are what the derived volume must
+    # respect. They are persisted in risk_state, so a restart cannot reset them.
+    max_open_positions: int = Field(default=1, ge=1, le=50)
     max_positions_per_symbol: int = Field(default=1, ge=1, le=5)
+    max_bot_capital_usd: float = Field(default=3.0, gt=0, le=1_000_000)
+    max_loss_per_trade_usd: float = Field(default=0.10, gt=0, le=100_000)
+    max_session_loss_usd: float = Field(default=0.30, gt=0, le=1_000_000)
+    max_daily_trades: int = Field(default=3, ge=1, le=10_000)
     min_signal_score: int = Field(default=75, ge=0, le=100)
     max_spread_points_default: int = Field(default=25, ge=1)
     order_deviation_points: int = Field(default=10, ge=0)

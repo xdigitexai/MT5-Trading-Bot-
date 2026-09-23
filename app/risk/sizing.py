@@ -118,6 +118,35 @@ def position_size(
     return lots
 
 
+def size_for_loss_budget(loss_budget: float, entry: float, stop_loss: float, spec: SymbolSpec) -> float | None:
+    """Lots whose loss at ``stop_loss`` costs at most ``loss_budget`` in account currency.
+
+    This is the hard-limit sizing path: the dollar budget and the *technical* stop distance are the
+    only inputs, so the volume is always derived and never fixed. The result is floored to
+    ``volume_step`` and clamped by ``volume_min``/``volume_max``; ``None`` means "do not trade",
+    which includes the case where even the broker's minimum volume would risk more than the budget.
+    """
+    if not _positive(loss_budget, entry, stop_loss): return None
+    per_lot = risk_per_lot(entry, stop_loss, spec)
+    if per_lot is None: return None
+    return normalize_volume(loss_budget / per_lot, spec)
+
+
+def minimum_volume_risk(entry: float, stop_loss: float, spec: SymbolSpec) -> float | None:
+    """Account-currency loss of the broker minimum volume over the stop distance, or None."""
+    per_lot = risk_per_lot(entry, stop_loss, spec)
+    if per_lot is None or not _positive(spec.volume_min): return None
+    return spec.volume_min * per_lot
+
+
+def value_per_point_per_lot(spec: SymbolSpec) -> float | None:
+    """Account-currency value of one ``point`` for one lot; None when the broker cannot answer."""
+    if not _positive(spec.point): return None
+    if _positive(spec.tick_size, spec.tick_value): return spec.point / spec.tick_size * spec.tick_value
+    if _positive(spec.contract_size): return spec.point * spec.contract_size
+    return None
+
+
 def min_stop_distance(spec: SymbolSpec) -> float:
     """Broker minimum stop distance in price units (stops level and freeze level)."""
     levels = max(spec.trade_stops_level or 0, spec.freeze_level or 0)

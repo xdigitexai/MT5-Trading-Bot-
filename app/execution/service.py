@@ -20,6 +20,7 @@ from app.core.schemas import TradeIntent
 from app.database.base import AuditRecord, ExecutionGuardRecord, SignalRecord, TradeRecord
 from app.execution.validation import validate_stops
 from app.mt5.constants import MT5Constants, mt5_constants
+from app.mt5.account import account_profile
 from app.mt5.gateway import MT5Gateway
 from app.risk.sizing import margin_within_free_margin, normalize_volume, required_margin, spec_from_symbol_info
 
@@ -181,8 +182,15 @@ class ExecutionService:
             return ExecutionResult(REJECTED, f"MT5 unavailable, no order sent: {health.detail}", ["MT5 unavailable, no order sent"])
         if self.gateway.symbol_info(signal.symbol) is None:
             return ExecutionResult(REJECTED, "symbol specification unavailable", ["symbol specification unavailable"])
-        if self.gateway.account_info() is None:
+        account = self.gateway.account_info()
+        if account is None:
             return ExecutionResult(REJECTED, "account information unavailable for margin verification", ["account information unavailable for margin verification"])
+        profile = account_profile(account)
+        if profile is None or not profile.classified:
+            return ExecutionResult(REJECTED, "the broker account trade mode could not be verified: refusing to send", ["unverified broker account trade mode"])
+        if profile.is_real and not settings.live_orders_permitted:
+            logger.critical("order_blocked_account_is_real symbol=%s trade_mode=%s live_orders_permitted=%s", signal.symbol, profile.trade_mode, settings.live_orders_permitted)
+            return ExecutionResult(REJECTED, f"the connected broker account is {profile.trade_mode_label} (trade_mode={profile.trade_mode}) and live trading is not enabled", ["real account without the live gate"])
         return None
 
     def _reserve(self, db: Session, key: str, intent: TradeIntent, volume: float) -> ExecutionGuardRecord | None:
