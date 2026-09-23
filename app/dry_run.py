@@ -54,7 +54,7 @@ VOLATILE_EXCLUSIONS = ("XNGUSD", "XAUUSD", "XAGUSD", "XTIUSD", "USOIL", "UKOIL",
 MAJORS = ("EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD", "EURGBP", "EURJPY", "GBPJPY")
 # The schema this code expects. tests/test_migrations.py asserts it is the head of the chain, so
 # the dry run reports a stale database as "not migrated" instead of guessing from a missing table.
-EXPECTED_ALEMBIC_REVISION = "0005_session_kill_switch"
+EXPECTED_ALEMBIC_REVISION = "0006_news_calendar"
 
 
 class ReadOnlyGateway:

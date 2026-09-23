@@ -9,8 +9,12 @@ and then, periodically, monitors open positions and reconciles MT5 history.
 
 Design rules:
 
-- **One runner.** A process-wide lock plus a ``scheduler_locks`` row make a second concurrent
-  cycle impossible. A cycle that cannot take the lock returns immediately instead of scanning.
+- **One runner, one leader.** A process-wide lock plus a ``scheduler_locks`` row make a second
+  concurrent cycle impossible, and the row is a *lease*: it is taken for the lifetime of the
+  leading loop and only refreshed each cycle, so exactly one process may scan. A process that does
+  not own the lease is a standby — it does not scan, does not order, and reports itself as standby
+  — and it takes the lease over only after the leader's heartbeat has gone stale, which is how a
+  crashed engine is replaced.
 - **One order per signal, ever.** The signal identity is
   ``symbol|strategy|timeframe|closed-candle close|direction``; it is used as the signal id, the
   trade id and the execution idempotency key. After a restart the same identity is recomputed, the
@@ -90,12 +94,18 @@ class SchedulerState:
     running: bool = False
     cycles: int = 0
     skipped_overlaps: int = 0
+    # Leadership: the database lease is held for the lifetime of the loop, not for one cycle, so a
+    # second process can never scan (let alone order) while this one leads. `standby` is true when
+    # this process is running but another scheduler owns the lease.
+    leader: bool = False
+    standby: bool = False
     last_scan_at: datetime | None = None
     last_signal_at: datetime | None = None
     last_execution_at: datetime | None = None
     last_reconciliation_at: datetime | None = None
     last_error: str | None = None
     last_cycle: dict | None = None
+    news: dict | None = None
 
 
 @dataclass
@@ -158,6 +168,16 @@ class MarketScheduler:
         return self.state.running
 
     @property
+    def leader(self) -> bool:
+        """True when this process owns the market-loop lease and may scan."""
+        return self.state.leader
+
+    @property
+    def standby(self) -> bool:
+        """True when this process is running but another scheduler owns the lease."""
+        return self.state.standby
+
+    @property
     def thread_alive(self) -> bool:
         return bool(self._thread is not None and self._thread.is_alive())
 
@@ -202,11 +222,16 @@ class MarketScheduler:
             thread.join(timeout)
         alive = bool(thread is not None and thread.is_alive())
         self.state.running = False
+        # A deliberate stop releases the lease immediately, so a restart (or a replacement process)
+        # does not have to wait for the lease to go stale. A crash leaves the row behind and the
+        # next leader takes over only once the heartbeat is older than the configured TTL.
+        released = self._release_lease()
+        self.state.leader, self.state.standby = False, False
         if alive:
             self.state.last_error = f"the scheduler thread did not stop within {timeout}s"
             logger.error("scheduler_stop_timeout timeout_s=%s", timeout)
             return False
-        logger.info("scheduler_stopped cycles=%s", self.state.cycles)
+        logger.info("scheduler_stopped cycles=%s lease_released=%s", self.state.cycles, released)
         return True
 
     def _loop(self) -> None:
@@ -218,14 +243,21 @@ class MarketScheduler:
         return {
             "running": self.running,
             "thread_alive": self.thread_alive,
+            # Exactly one process may scan and order: this is that process's own answer, and the
+            # database lease is what makes it true across processes rather than within one.
+            "leader": self.state.leader,
+            "standby": self.state.standby,
+            "owner": self.owner,
             "cycles": self.state.cycles,
             "skipped_overlaps": self.state.skipped_overlaps,
             "interval_seconds": self.settings.scheduler_interval_seconds,
+            "lock_ttl_seconds": self.settings.scheduler_lock_ttl_seconds,
             "last_scan_at": isoformat(self.state.last_scan_at),
             "last_signal_at": isoformat(self.state.last_signal_at),
             "last_execution_at": isoformat(self.state.last_execution_at),
             "last_reconciliation_at": isoformat(self.state.last_reconciliation_at),
             "last_error": self.state.last_error,
+            "news": self.state.news,
             "symbols": list(self.settings.symbols),
             "last_cycle": self.state.last_cycle,
         }
@@ -252,14 +284,17 @@ class MarketScheduler:
             self._lock.release()
 
     def _cycle(self, db: Session, now: datetime) -> dict:
-        summary = {"skipped": False, "started_at": now.isoformat(), "symbols": {}, "candidates": 0, "signals": 0, "executions": 0, "duplicates": 0, "blocked": [], "errors": [], "positions": None, "reconciliation": None}
+        summary = {"skipped": False, "leader": False, "started_at": now.isoformat(), "symbols": {}, "candidates": 0, "signals": 0, "executions": 0, "duplicates": 0, "blocked": [], "errors": [], "positions": None, "reconciliation": None, "news": None}
         if not self._acquire_db_lock(db, now):
+            # A non-leader never scans: the lease is held for the lifetime of the leading loop, so
+            # two processes can never both turn a candle into an order.
+            self.state.leader, self.state.standby = False, True
             summary.update(skipped=True, reason="another scheduler owns the market loop lock")
+            logger.warning("scheduler_standby reason=lease_held_by_another_process owner=%s", self.owner)
         else:
-            try:
-                self._run_cycle(db, summary, now)
-            finally:
-                self._release_db_lock(db)
+            self.state.leader, self.state.standby = True, False
+            summary["leader"] = True
+            self._run_cycle(db, summary, now)
         summary["finished_at"] = self.clock().isoformat()
         self.state.last_cycle = summary
         return summary
@@ -270,6 +305,10 @@ class MarketScheduler:
             summary["blocked"].append("the emergency lock is persisted: no scan was performed")
             logger.warning("scheduler_cycle_blocked reason=emergency_locked")
             return
+        # One calendar refresh per cycle serves every symbol: the provider is never asked once per
+        # symbol, and the gate reads the same snapshot for the whole scan.
+        summary["news"] = self._refresh_news(now)
+        self.state.news = summary["news"]
         for symbol in self.settings.symbols:
             result = self._scan_symbol(db, symbol, now, store, summary)
             summary["symbols"][symbol] = result
@@ -282,6 +321,23 @@ class MarketScheduler:
         summary["positions"] = self._monitor_positions()
         if self._reconciliation_due(now):
             summary["reconciliation"] = self._reconcile(db, now)
+
+    def _refresh_news(self, now: datetime) -> dict | None:
+        """Refresh the calendar once per cycle and report its health; never raises, never guesses."""
+        refresh = getattr(self.news, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh(now)
+            except Exception as error:  # a broken provider must block trading, not the cycle
+                logger.error("news_refresh_failed provider=%s error=%s", getattr(self.news, "provider", "unknown"), type(error).__name__)
+        status = getattr(self.news, "status", None)
+        if not callable(status):
+            return None
+        try:
+            return status(now)
+        except Exception as error:
+            logger.error("news_status_failed provider=%s error=%s", getattr(self.news, "provider", "unknown"), type(error).__name__)
+            return None
 
     def _monitor_positions(self) -> dict:
         positions = self.gateway.positions()
@@ -626,6 +682,13 @@ class MarketScheduler:
         return total
 
     def _acquire_db_lock(self, db: Session, now: datetime) -> bool:
+        """Take or renew the market-loop lease; False means another process is the leader.
+
+        The lease is *not* released at the end of a cycle: it is held for the lifetime of the
+        leading loop and only goes stale when its heartbeat stops, which is what makes exactly one
+        process able to scan and order. A crashed leader is replaced once ``scheduler_lock_ttl_seconds``
+        have passed without a heartbeat.
+        """
         row = db.scalar(select(SchedulerLockRecord).where(SchedulerLockRecord.lock_key == LOCK_KEY))
         if row is None:
             db.add(SchedulerLockRecord(lock_key=LOCK_KEY, owner=self.owner, acquired_at=now, heartbeat_at=now))
@@ -635,6 +698,7 @@ class MarketScheduler:
                 db.rollback()
                 logger.warning("scheduler_lock_race owner=%s", self.owner)
                 return False
+            logger.info("scheduler_lease_acquired owner=%s", self.owner)
             return True
         if row.owner == self.owner:
             row.heartbeat_at = now
@@ -644,7 +708,7 @@ class MarketScheduler:
         if heartbeat is not None and (now - heartbeat) <= timedelta(seconds=self.settings.scheduler_lock_ttl_seconds):
             logger.warning("scheduler_lock_held owner=%s age_s=%.0f", row.owner, (now - heartbeat).total_seconds())
             return False
-        logger.warning("scheduler_lock_taken_over stale_owner=%s", row.owner)
+        logger.warning("scheduler_lock_taken_over stale_owner=%s age_s=%s", row.owner, "unknown" if heartbeat is None else f"{(now - heartbeat).total_seconds():.0f}")
         row.owner, row.acquired_at, row.heartbeat_at = self.owner, now, now
         db.commit()
         return True
@@ -655,6 +719,24 @@ class MarketScheduler:
             if row is not None:
                 db.delete(row)
                 db.commit()
+                logger.info("scheduler_lease_released owner=%s", self.owner)
         except Exception as error:
             db.rollback()
             logger.error("scheduler_lock_release_failed error=%s", type(error).__name__)
+
+    def _release_lease(self) -> bool:
+        """Release the lease on a deliberate stop; a crash deliberately leaves it to expire."""
+        if self.session_factory is None:
+            self.state.leader = False
+            return False
+        db = None
+        try:
+            db = self.session_factory()
+            self._release_db_lock(db)
+            return True
+        except Exception as error:
+            logger.warning("scheduler_lease_release_failed error=%s (the lease will expire by TTL)", type(error).__name__)
+            return False
+        finally:
+            if db is not None:
+                db.close()

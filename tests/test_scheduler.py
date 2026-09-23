@@ -59,6 +59,26 @@ def rows(db, model):
     return list(db.scalars(select(model)))
 
 
+def expire_lease(db, seconds: float = 10_000) -> None:
+    """Age the market-loop lease past its TTL, exactly as an abandoned process leaves it."""
+    row = db.scalar(select(SchedulerLockRecord))
+    if row is not None:
+        row.heartbeat_at = as_utc(row.heartbeat_at) - timedelta(seconds=seconds)
+        db.commit()
+
+
+def process_cycle(scheduler: MarketScheduler, now: datetime) -> dict:
+    """One cycle as a standalone process would run it, releasing the lease on the way out.
+
+    A test that builds several schedulers in a row is modelling several processes; each one has to
+    give the loop back before the next may lead it.
+    """
+    try:
+        return scheduler.run_once(now=now)
+    finally:
+        scheduler.stop()
+
+
 def test_cycle_executes_one_risk_sized_order_and_persists_the_signal(settings, session_factory, db):
     now = datetime.now(timezone.utc)
     gateway = market_gateway(now)
@@ -102,7 +122,11 @@ def test_cycle_executes_one_risk_sized_order_and_persists_the_signal(settings, s
 def test_the_same_closed_candle_never_orders_twice_across_a_restart(settings, session_factory, db):
     now = datetime.now(timezone.utc)
     first_gateway = market_gateway(now)
-    assert scheduler_for(trading_settings(), first_gateway, session_factory).run_once(now=now)["executions"] == 1
+    first = scheduler_for(trading_settings(), first_gateway, session_factory)
+    assert first.run_once(now=now)["executions"] == 1
+    # A restart is a clean stop plus a new process: the lease is released on the way out.
+    assert first.stop() is True
+    assert db.scalar(select(SchedulerLockRecord)) is None
 
     # A restart rebuilds every object: only the database remembers what happened.
     second_gateway = market_gateway(now)
@@ -117,6 +141,7 @@ def test_the_same_closed_candle_never_orders_twice_across_a_restart(settings, se
 
     # Even with the persisted signal removed, the order is still refused: the gate sees the trade
     # and the reserved idempotency key the first cycle left behind.
+    second.stop()
     db.delete(db.scalar(select(SignalRecord)))
     db.commit()
     third_gateway = market_gateway(now)
@@ -154,11 +179,60 @@ def test_a_second_scheduler_cannot_take_a_held_database_lock(settings, session_f
     challenger = scheduler_for(trading_settings(), challenger_gateway, session_factory)
     blocked = challenger.run_once(now=now)
     assert blocked["skipped"] is True and "lock" in blocked["reason"]
+    assert blocked["leader"] is False and challenger.standby is True and challenger.leader is False
     assert challenger_gateway.requests == []
+    assert challenger.state.cycles == 0  # a standby never scans a symbol at all
 
     owner._release_db_lock(holder)
     assert challenger.run_once(now=now)["executions"] == 1
+    assert challenger.leader is True
     assert len(challenger_gateway.requests) == 1
+
+
+def test_the_lease_is_held_across_cycles_and_released_only_on_a_deliberate_stop(settings, session_factory, db):
+    """The lock is a lease, not a per-cycle mutex: leadership survives between cycles."""
+    now = datetime.now(timezone.utc)
+    gateway = market_gateway(now)
+    leader = scheduler_for(trading_settings(), gateway, session_factory)
+
+    assert leader.run_once(now=now)["leader"] is True
+    row = db.scalar(select(SchedulerLockRecord))
+    assert row is not None and row.owner == leader.owner and as_utc(row.heartbeat_at) == now
+
+    later = now + timedelta(seconds=60)
+    assert leader.run_once(now=later)["leader"] is True
+    db.refresh(row)
+    assert as_utc(row.heartbeat_at) == later  # the heartbeat moved with the cycle
+    assert leader.leader is True and leader.standby is False
+
+    assert leader.stop() is True
+    assert db.scalar(select(SchedulerLockRecord)) is None  # a clean stop frees the loop at once
+
+
+def test_two_scheduler_instances_can_never_both_turn_a_candle_into_an_order(settings, session_factory, db):
+    """Two independent schedulers, one database: only the leader may scan, and only one order exists."""
+    now = datetime.now(timezone.utc)
+    first_gateway = market_gateway(now)
+    second_gateway = market_gateway(now)
+    first = scheduler_for(trading_settings(), first_gateway, session_factory)
+    second = scheduler_for(trading_settings(), second_gateway, session_factory)
+
+    assert first.run_once(now=now)["executions"] == 1
+    assert len(first_gateway.requests) == 1
+
+    # The second process keeps running, but it is a standby: it never fetches candles, never
+    # evaluates a strategy and never reaches the broker.
+    standby = second.run_once(now=now)
+    assert standby["skipped"] is True and standby["reason"] == "another scheduler owns the market loop lock"
+    assert second_gateway.requests == [] and second_gateway.rates_calls == []
+    assert len(rows(db, TradeRecord)) == 1 and len(rows(db, ExecutionGuardRecord)) == 1
+
+    # Handing the loop over (the leader stopped) does not create a second order either: the closed
+    # candle was already turned into a signal, so the successor sees a duplicate.
+    assert first.stop() is True
+    successor = second.run_once(now=now)
+    assert successor["leader"] is True and successor["executions"] == 0 and successor["duplicates"] == 1
+    assert second_gateway.requests == [] and len(rows(db, TradeRecord)) == 1
 
 
 def test_a_stale_database_lock_is_taken_over_after_a_crash(settings, session_factory, db):
@@ -167,10 +241,12 @@ def test_a_stale_database_lock_is_taken_over_after_a_crash(settings, session_fac
     db.commit()
 
     gateway = market_gateway(now)
-    summary = scheduler_for(trading_settings(), gateway, session_factory).run_once(now=now)
+    scheduler = scheduler_for(trading_settings(), gateway, session_factory)
+    summary = scheduler.run_once(now=now)
 
     assert summary["skipped"] is False and summary["executions"] == 1
-    assert db.scalar(select(SchedulerLockRecord)) is None  # released again after the cycle
+    row = db.scalar(select(SchedulerLockRecord))  # the lease moved to the new leader
+    assert row is not None and row.owner == scheduler.owner and as_utc(row.heartbeat_at) == now
 
 
 def test_fail_closed_when_mt5_is_not_connected(settings, session_factory, db):
@@ -187,19 +263,19 @@ def test_fail_closed_when_mt5_is_not_connected(settings, session_factory, db):
 def test_fail_closed_on_a_stale_tick_or_missing_candles(settings, session_factory, db):
     now = datetime.now(timezone.utc)
     stale_tick = FakeGateway(bar_frames=market_frames(now), tick_value=FakeTick(time=(now - timedelta(hours=5)).timestamp()))
-    stale = scheduler_for(trading_settings(), stale_tick, session_factory).run_once(now=now)
+    stale = process_cycle(scheduler_for(trading_settings(), stale_tick, session_factory), now)
     assert stale_tick.requests == [] and "old" in stale["symbols"]["EURUSD"]["blocked"][0]
 
     no_candles = FakeGateway(tick_value=FakeTick(time=now.timestamp()))
-    empty = scheduler_for(trading_settings(), no_candles, session_factory).run_once(now=now)
+    empty = process_cycle(scheduler_for(trading_settings(), no_candles, session_factory), now)
     assert no_candles.requests == [] and "candles unavailable" in empty["symbols"]["EURUSD"]["blocked"][0]
 
     no_symbol = FakeGateway(symbols={}, bar_frames=market_frames(now), tick_value=FakeTick(time=now.timestamp()))
-    missing = scheduler_for(trading_settings(), no_symbol, session_factory).run_once(now=now)
+    missing = process_cycle(scheduler_for(trading_settings(), no_symbol, session_factory), now)
     assert no_symbol.requests == [] and "symbol specification" in missing["symbols"]["EURUSD"]["blocked"][0]
 
     no_account = market_gateway(now, account=None)
-    unreadable = scheduler_for(trading_settings(), no_account, session_factory).run_once(now=now)
+    unreadable = process_cycle(scheduler_for(trading_settings(), no_account, session_factory), now)
     assert no_account.requests == [] and "account information" in unreadable["symbols"]["EURUSD"]["blocked"][0]
     assert rows(db, SignalRecord) == []
 
@@ -236,12 +312,12 @@ def test_a_configured_news_window_blocks_and_a_clear_window_allows_trading(setti
     event = NewsEvent(when=now, currency="EUR", impact="high", title="ECB press conference")
     blocked_gateway = market_gateway(now)
     news = StaticNewsProvider([event], fail_closed=True, window_minutes=30)
-    blocked = scheduler_for(trading_settings(), blocked_gateway, session_factory, news=news).run_once(now=now)
+    blocked = process_cycle(scheduler_for(trading_settings(), blocked_gateway, session_factory, news=news), now)
     assert blocked_gateway.requests == [] and "ECB press conference" in blocked["symbols"]["EURUSD"]["blocked"][0]
 
     clear_gateway = market_gateway(now)
     later = StaticNewsProvider([NewsEvent(when=now + timedelta(hours=6), currency="EUR", impact="high")], fail_closed=True, window_minutes=30)
-    executed = scheduler_for(trading_settings(), clear_gateway, session_factory, news=later).run_once(now=now)
+    executed = process_cycle(scheduler_for(trading_settings(), clear_gateway, session_factory, news=later), now)
     assert executed["executions"] == 1 and len(clear_gateway.requests) == 1
 
 
@@ -280,11 +356,11 @@ def test_ensemble_decides_when_it_is_enabled(settings, session_factory, db):
     now = datetime.now(timezone.utc)
     quiet_gateway = market_gateway(now)
     quiet = scheduler_for(trading_settings(enabled_strategies=["trend_following", "ensemble"]), quiet_gateway, session_factory)
-    assert quiet.run_once(now=now)["candidates"] == 0 and quiet_gateway.requests == []
+    assert process_cycle(quiet, now)["candidates"] == 0 and quiet_gateway.requests == []
 
     loud_gateway = market_gateway(now)
     loud = scheduler_for(trading_settings(enabled_strategies=["trend_following", "ensemble"], ensemble_min_votes=1), loud_gateway, session_factory)
-    summary = loud.run_once(now=now)
+    summary = process_cycle(loud, now)
 
     assert summary["executions"] == 1
     row = db.scalar(select(SignalRecord))
@@ -307,13 +383,18 @@ def test_a_signal_left_new_by_a_crash_is_retried_only_after_the_staleness_window
     assert len(rows(db, SignalRecord)) == 1 and db.scalar(select(SignalRecord)).status == SignalStatus.NEW.value
     assert gateway.requests == []
 
+    # The crashed process is gone, so its lease has expired by the time the replacement starts.
+    expire_lease(db)
+
     monkeypatch.setattr(scheduler, "_levels", original)
     fresh = scheduler.run_once(now=now)
+    assert fresh["leader"] is True
     assert fresh["duplicates"] == 1 and fresh["executions"] == 0  # still inside the staleness window
 
     row = db.scalar(select(SignalRecord))
     row.created_at = now - timedelta(hours=2)
     db.commit()
+    expire_lease(db)
     retried_gateway = market_gateway(now)
     retried = scheduler_for(trading_settings(stale_guard_seconds=3600), retried_gateway, session_factory).run_once(now=now)
 

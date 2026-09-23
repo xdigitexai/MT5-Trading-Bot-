@@ -18,8 +18,9 @@ from app.core.schemas import EmergencyRequest
 from app.database.base import AuditRecord, SignalRecord, TradeRecord
 from app.database.session import SessionLocal, get_db
 from app.execution.service import ExecutionService
+from app.mt5.account import account_matches
 from app.mt5.gateway import MT5Gateway
-from app.news.provider import build_news_provider
+from app.news.provider import SqlNewsCache, build_news_provider
 from app.risk.state import RiskStateStore
 from app.services.analytics import performance as performance_summary
 from app.services.analytics import statistics as statistics_summary
@@ -30,7 +31,7 @@ from app.strategies import ENSEMBLE, STRATEGIES, STRATEGY_NAMES, enabled_strateg
 
 settings = get_settings()
 gateway = MT5Gateway(settings)
-news = build_news_provider(settings)
+news = build_news_provider(settings, SqlNewsCache(SessionLocal))
 reconciler = Reconciler(settings, gateway)
 scheduler = MarketScheduler(settings, gateway, SessionLocal, news=news, reconciler=reconciler)
 execution = ExecutionService(settings, gateway)
@@ -210,6 +211,98 @@ def risk(db: Session = Depends(get_db)):
 @app.get("/api/bot/status", dependencies=[Depends(auth)])
 def status(service: BotService = Depends(current_bot)):
     return service.status()
+
+
+def _database_healthy(db: Session) -> tuple[bool, str]:
+    from sqlalchemy import text as sql_text
+    try:
+        db.execute(sql_text("SELECT 1"))
+        return True, ""
+    except Exception as error:
+        return False, f"the database is unreachable ({type(error).__name__})"
+
+
+@app.get("/api/news/status", dependencies=[Depends(auth)])
+def news_status():
+    """Calendar provider health, data age and the gate's current verdict shape; never a credential."""
+    return news.status()
+
+
+@app.get("/api/status", dependencies=[Depends(auth)])
+def operational_status(db: Session = Depends(get_db)):
+    """One authenticated answer for every operational question, and no credential anywhere in it."""
+    health = gateway.health()
+    profile = bot.account_profile()
+    database_ok, database_detail = _database_healthy(db)
+    risk = None
+    risk_ok, risk_detail = False, "the persisted risk state could not be read"
+    try:
+        row = RiskStateStore(db).load()
+        risk_ok = True
+        risk_detail = ""
+        risk = {
+            "day": row.day.isoformat(),
+            "realized_pnl": float(row.realized_pnl or 0.0),
+            "session_loss_usd": max(0.0, -float(row.realized_pnl or 0.0)),
+            "trades_opened": int(row.trades_opened or 0),
+            "max_daily_trades": settings.max_daily_trades,
+            "session_started_at": isoformat(row.session_started_at),
+            "emergency_locked": bool(row.emergency_locked),
+            "kill_switch_reason": row.kill_switch_reason,
+            "kill_switch_active": bool((row.kill_switch_reason or "").strip()),
+        }
+    except Exception as error:
+        risk_detail = f"the persisted risk state could not be read ({type(error).__name__})"
+    positions = gateway.positions()
+    managed = None if positions is None else [p for p in positions if getattr(p, "magic", settings.magic_number) == settings.magic_number]
+    scheduler_status = scheduler.status()
+    account_ok, account_detail = account_matches(profile, settings.mt5_login, settings.mt5_server)
+    return {
+        "engine": {"running": bot.state.running, "state": bot.state.state.value, "detail": bot.state.detail},
+        "mt5": {"connected": health.connected, "detail": health.detail},
+        "account": {
+            "matches_expected": account_ok,
+            "mismatch_reason": account_detail,
+            "login": None if profile is None else profile.login,
+            "server": None if profile is None else profile.server,
+            "expected_login": settings.mt5_login,
+            "expected_server": settings.mt5_server,
+            "account_type": "UNKNOWN" if profile is None else profile.trade_mode_label,
+            "is_real": None if profile is None else profile.is_real,
+            "balance": None if profile is None else profile.balance,
+            "currency": None if profile is None else profile.currency,
+        },
+        "database": {"healthy": database_ok, "detail": database_detail},
+        "risk_store": {"healthy": risk_ok, "detail": risk_detail},
+        "calendar": news.status(),
+        "scheduler": {
+            "running": scheduler_status["running"],
+            "leader": scheduler_status["leader"],
+            "standby": scheduler_status["standby"],
+            "owner": scheduler_status["owner"],
+            "heartbeat_at": scheduler_status["last_scan_at"],
+            "cycles": scheduler_status["cycles"],
+            "interval_seconds": scheduler_status["interval_seconds"],
+            "lock_ttl_seconds": scheduler_status["lock_ttl_seconds"],
+            "last_error": scheduler_status["last_error"],
+        },
+        "live_orders_permitted": settings.live_orders_permitted,
+        "trading_mode": settings.trading_mode.value,
+        "positions": {
+            "open": None if managed is None else len(managed),
+            "readable": positions is not None,
+            "universe_open": None if positions is None else len(positions),
+        },
+        "risk": risk,
+        "hard_limits": {
+            "max_bot_capital_usd": settings.max_bot_capital_usd,
+            "max_loss_per_trade_usd": settings.max_loss_per_trade_usd,
+            "max_session_loss_usd": settings.max_session_loss_usd,
+            "max_daily_trades": settings.max_daily_trades,
+            "max_open_positions": settings.max_open_positions,
+            "max_lots_per_position": settings.max_lots_per_position,
+        },
+    }
 
 
 @app.post("/api/bot/start", dependencies=[Depends(auth)])

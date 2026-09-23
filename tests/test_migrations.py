@@ -8,11 +8,11 @@ from pathlib import Path
 import sqlalchemy as sa
 
 from app.core.config import Settings
-from app.database.base import ExecutionGuardRecord, RiskStateRecord, SignalRecord, TradeRecord
+from app.database.base import ExecutionGuardRecord, NewsEventRecord, NewsProviderStateRecord, RiskStateRecord, SignalRecord, TradeRecord
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSIONS = ROOT / "migrations" / "versions"
-NEW_TABLES = (SignalRecord, RiskStateRecord, ExecutionGuardRecord)
+NEW_TABLES = (SignalRecord, RiskStateRecord, ExecutionGuardRecord, NewsEventRecord, NewsProviderStateRecord)
 NEW_TRADE_COLUMNS = {"exit_price", "commission", "swap", "profit", "open_time", "close_time", "mt5_deal_ticket", "volume_closed", "reconciled_at", "close_reason"}
 
 

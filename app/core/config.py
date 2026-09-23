@@ -78,6 +78,22 @@ class Settings(BaseSettings):
     stale_guard_seconds: int = Field(default=900, ge=1)
     news_window_minutes: int = Field(default=30, ge=0, le=1440)
     news_events_file: str | None = None
+    # Calendar provider. `trading_economics` reads the official Trading Economics calendar API; the
+    # credential is read from the environment only and is never logged. A provider that cannot be
+    # reached, cannot be authorized, cannot be parsed or is older than NEWS_MAX_AGE_SECONDS is
+    # reported as unusable, and NEWS_FAIL_CLOSED then refuses every new entry.
+    news_provider: str = "static"
+    trading_economics_api_key: SecretStr | None = None
+    trading_economics_base_url: str = "https://api.tradingeconomics.com"
+    news_refresh_seconds: int = Field(default=300, ge=5, le=86_400)
+    news_max_age_seconds: int = Field(default=900, ge=30, le=604_800)
+    news_provider_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
+    news_lookback_hours: int = Field(default=12, ge=0, le=720)
+    news_horizon_hours: int = Field(default=168, ge=1, le=8760)
+    # Read only by runtime/engine_service.py, the unattended Windows runner: it decides whether the
+    # runner asks the API to resume the market loop after a reboot. It never bypasses a gate - the
+    # runner calls the same validated /api/bot/start an operator would.
+    auto_start_trading: bool = False
 
     @field_validator("allowed_origins", "symbols", "enabled_strategies", mode="before")
     @classmethod

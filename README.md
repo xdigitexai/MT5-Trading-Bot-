@@ -9,6 +9,7 @@ This is a **fail-closed, demo-first** algorithmic trading system. It does not pr
 - Every order requires a stop loss, risk approval, valid symbol/tick/spread/margin checks, and an idempotency key.
 - Unavailable MT5, database, market data, or news policy fails closed: no new orders.
 - `NEWS_FAIL_CLOSED=true` (the default) blocks new trades while no news calendar is configured: with no calendar there is no protection window to enforce, so the bot fails closed instead of pretending. Point `NEWS_EVENTS_FILE` at a JSON calendar, or set `NEWS_FAIL_CLOSED=false` to accept trading without news protection.
+- `NEWS_PROVIDER=trading_economics` reads the official Trading Economics calendar **API** (`api.tradingeconomics.com`, never their website and never a scrape). Rows are normalised into the app's news-event representation (`event id`, title, country, currency, UTC timestamp, impact, actual, forecast, previous, `retrieved_at`, provider), cached in `news_events`/`news_provider_state` so the provider is not called once per symbol per cycle, and matched to pairs by currency — a EUR event blocks EURUSD and EURGBP, never GBPJPY. Only **high-impact** events inside `NEWS_WINDOW_MINUTES` around the release block, and only *new* entries: the provider can never close an open position. A missing or rejected credential, a transport error, a non-200 answer, an unparsable payload, an invalid timestamp and a calendar older than `NEWS_MAX_AGE_SECONDS` are all reported as unusable, and `NEWS_FAIL_CLOSED=true` then refuses every new entry. The credential is read from `TRADING_ECONOMICS_API_KEY` in the environment only and is never logged.
 
 ## Hard server-side risk limits
 
@@ -84,6 +85,41 @@ would report a different store's allowance.
 7. Start only after reviewing `/api/risk`: `POST /api/bot/start` with `Authorization: Bearer <API_TOKEN>`. The market loop then scans the configured symbols on `SCHEDULER_INTERVAL_SECONDS` and reconciles MT5 history on `RECONCILIATION_INTERVAL_SECONDS`; `GET /api/bot/status` reports the loop state, `GET /api/signals` the persisted signals, and `GET /api/performance` plus `GET /api/statistics` the analytics of the trades MT5 has confirmed as closed.
 
 Run unit tests with `pytest`. Demo integration tests require `RUN_MT5_INTEGRATION=1` and a configured demo account.
+
+## Unattended startup on Windows
+
+`runtime/engine_service.py` is what the Windows Task Scheduler starts; `runtime/engine_task.xml` is
+the task it registers (`MT5TradingBotEngine`).
+
+```
+schtasks /create /tn "MT5TradingBotEngine" /xml "runtime\engine_task.xml" /f   # elevated shell
+# or, without elevation, for the current user:
+Register-ScheduledTask -TaskName "MT5TradingBotEngine" -Xml (Get-Content -Raw runtime\engine_task.xml) -Force
+Start-ScheduledTask -TaskName "MT5TradingBotEngine"
+```
+
+- **Trigger.** Logon, in the interactive session, because the `MetaTrader5` package talks to
+  `terminal64.exe`, which only exists there. `MultipleInstancesPolicy=IgnoreNew` discards a second
+  launch, and the market loop's database lease means a second *scheduler* still cannot order.
+- **Restart.** The runner restarts the API after an unexpected exit, and the task carries a
+  restart-on-failure policy for a harness-level failure. `runtime/stop_engine.flag` is the
+  deliberate stop: create it and end the task.
+- **Logs.** `runtime/logs/engine.log`, rotating at 5 MB with five kept files. Nothing here writes a
+  credential: the application logs symbols, statuses and reasons only.
+- **Resume.** With `AUTO_START_TRADING=true` the runner asks the API for `POST /api/bot/start` once
+  the API answers — the same validated path an operator would use. Trading therefore resumes only
+  after the persistent risk state, PostgreSQL, MT5, the pinned account, the emergency lock, the
+  session loss, the trade count and the news provider have all been verified. Anything that does not
+  verify leaves the engine running, serving status, and refusing to trade.
+
+## Operational status
+
+`GET /api/status` (bearer token) answers in one call: engine state, MT5 connectivity, the account
+and whether it is the pinned one, the account's real/demo trade mode, database and risk-store
+health, the calendar provider's health and **data age**, the scheduler's heartbeat and whether this
+process is the single leader, `live_orders_permitted`, the open-position count, the session realized
+P/L, trades used / `MAX_DAILY_TRADES` and the kill-switch state. No credential appears in it or in
+any log line.
 
 ## Known deployment boundary
 

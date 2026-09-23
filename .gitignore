@@ -14,4 +14,9 @@ dist/
 build/
 *.egg-info/
 .dry_run_risk_state.db
-runtime/
+# Everything under runtime/ is local state (logs, stop flags, dry-run output). The unattended
+# runner and its task definition are deployment code, so they are tracked; the directory itself is
+# not excluded, because git cannot re-include a file whose parent directory is excluded.
+runtime/*
+!runtime/engine_service.py
+!runtime/engine_task.xml

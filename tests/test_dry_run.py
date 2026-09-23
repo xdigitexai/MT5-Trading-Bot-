@@ -102,4 +102,4 @@ def test_the_dry_run_reports_a_stale_schema_as_a_rejection(monkeypatch, session_
 
     report = dry_run.build_report(hard_settings(), gateway, now)
 
-    assert report["verdict"] == "REJECT" and "not at 0005_session_kill_switch" in report["reason"]
+    assert report["verdict"] == "REJECT" and "not at 0006_news_calendar" in report["reason"]

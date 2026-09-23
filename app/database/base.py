@@ -103,3 +103,40 @@ class ExecutionGuardRecord(Base):
     order_ticket: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class NewsEventRecord(Base):
+    """One cached calendar row, in the app's own representation.
+
+    The news gate must not call the provider once per symbol per cycle, and a restarted process
+    must be able to read back *when* the calendar it holds was retrieved: that timestamp is what
+    separates a fresh calendar from a stale one. Nothing here is ever synthesised - a row exists
+    only because a real provider answered with it.
+    """
+    __tablename__ = "news_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), index=True)
+    event_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    country: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    currency: Mapped[str] = mapped_column(String(8), index=True)
+    impact: Mapped[str] = mapped_column(String(16), index=True)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    actual: Mapped[str | None] = mapped_column(Text, nullable=True)
+    forecast: Mapped[str | None] = mapped_column(Text, nullable=True)
+    previous: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class NewsProviderStateRecord(Base):
+    """Health of one calendar provider: when it was last attempted and last answered."""
+    __tablename__ = "news_provider_state"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    healthy: Mapped[bool] = mapped_column(Boolean, default=False)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retrieved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
